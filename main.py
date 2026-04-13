@@ -130,7 +130,7 @@ class TradingBot:
         self._cycle_count = 0
         self._last_update_id = 0
 
-        # Mutable params (shared with Telegram)
+        # Mutable params (shared with Telegram) — SCALPING defaults
         self._params = {
             "use_trailing_stop": self.config.bot.use_trailing_stop,
             "tsl_activation": self.config.bot.trailing_activation,
@@ -138,8 +138,8 @@ class TradingBot:
             "risk_percent": self.config.bot.risk_percent,
             "min_confidence": self.config.bot.min_confidence,
             "max_positions": self.config.bot.max_positions,
-            "atr_sl_mult": 2.0,
-            "atr_tp_mult": 4.0,
+            "atr_sl_mult": 1.0,
+            "atr_tp_mult": 1.5,
             "paused": False,
             "cycle_count": 0,
             "balance": 0.0,
@@ -154,7 +154,7 @@ class TradingBot:
     def initialize(self) -> bool:
         """Initialize all components and connect to MT5."""
         self.logger.info("=" * 60)
-        self.logger.info("  EXNESS AI TRADING BOT v3.0 — SURVIVAL MODE")
+        self.logger.info("  EXNESS AI TRADING BOT v4.0 — SCALPING MODE")
         self.logger.info("=" * 60)
 
         # 1. Connect to broker
@@ -214,13 +214,17 @@ class TradingBot:
         self._running = True
 
         self.logger.info(f"Bot initialized. Pairs: {get_all_pairs()}")
-        self.logger.info("Strategy: Pure indicators (no LSTM)")
+        self.logger.info("Strategy: Pure indicators (no LSTM) — SCALPING")
         self.logger.info(f"Risk: {self.config.bot.risk_percent}% per trade")
         self.logger.info(
             f"Sessions: {self.config.bot.session_start_utc}:00-"
-            f"{self.config.bot.session_end_utc}:00 UTC"
+            f"{self.config.bot.session_end_utc}:00 UTC (London-NY overlap)"
         )
-        self.trade_log.log_status("Bot started (SURVIVAL MODE)")
+        self.logger.info(f"TF: {self.config.bot.timeframe} | Cycle: {self.config.bot.check_interval_minutes}min")
+        self.logger.info(
+            f"TSL: act={self.config.bot.trailing_activation}×, trail={self.config.bot.trailing_atr_mult}× ATR"
+        )
+        self.trade_log.log_status("Bot started (SCALPING MODE)")
 
         # Send notification
         self.notifier.notify_bot_started(get_all_pairs())
@@ -311,6 +315,15 @@ class TradingBot:
         is_blackout, reason = self._news_filter.check_blackout("XAUUSD")
         if is_blackout:
             self.logger.info(f"FILTER: {reason}")
+
+            # Close all positions if session ended (no overnight)
+            if self.config.bot.close_all_on_session_end and "Outside trading hours" in reason:
+                for symbol in get_all_pairs():
+                    closed = self.order_mgr.close_all_positions(symbol)
+                    if closed > 0:
+                        self.logger.info(f"Session ended: closed {closed} {symbol} position(s)")
+                        self.notifier.send(f"🔒 Session ended. Closed {closed} {symbol} position(s).")
+
             if self.sm.state != BotState.PAUSED:
                 self.pause(reason=reason)
             return

@@ -34,22 +34,23 @@ class TradeSignal:
 
 class SignalGenerator:
     """
-    Pure indicator-based signal generator.
+    Pure indicator-based signal generator — SCALPING MODE.
     No ML/LSTM — just proven technical confluence.
+    Optimized for M5 timeframe, tight SL, quick TP.
 
-    Scoring:
+    Scoring (tighter thresholds for scalping):
     - EMA crossover: 0.35 (trend change)
     - EMA trend: 0.15 (direction alignment)
     - RSI filter: 0.25 (momentum confirmation)
     - MACD: 0.20 (momentum direction)
     - Bollinger Bands: 0.20 (overbought/oversold)
-    - EMA200 bias: multiplier (trend filter)
+    - EMA200 bias: multiplier 0.40 (strong trend filter)
     """
 
     def __init__(
         self,
-        ema200_trend_bias: float = 0.30,
-        min_confidence: float = 0.40,
+        ema200_trend_bias: float = 0.40,
+        min_confidence: float = 0.50,
     ):
         self.ema200_trend_bias = ema200_trend_bias
         self.min_confidence = min_confidence

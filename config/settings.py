@@ -26,31 +26,34 @@ class TelegramConfig:
 
 @dataclass
 class BotConfig:
-    """Runtime bot parameters — SURVIVAL MODE defaults."""
+    """Runtime bot parameters — SCALPING MODE defaults."""
     pairs: list = field(default_factory=lambda: ["XAUUSD", "BTCUSD"])
-    timeframe: str = os.getenv("TIMEFRAME", "M15")         # M15 / H1 / H4
-    check_interval_minutes: int = int(os.getenv("CHECK_INTERVAL", "15"))
+    timeframe: str = os.getenv("TIMEFRAME", "M5")          # M5 for scalping
+    check_interval_minutes: int = int(os.getenv("CHECK_INTERVAL", "5"))
 
-    # Risk management (SURVIVAL MODE)
-    risk_percent: float = 0.5                              # 0.5% per trade
-    max_positions: int = 2                                  # Max 2 open per pair
-    max_daily_drawdown_pct: float = 3.0                     # Stop at 3% daily loss
-    max_weekly_drawdown_pct: float = 8.0                    # Stop at 8% weekly loss
-    max_consecutive_losses: int = 3                         # Pause after 3 losses
+    # Risk management (SCALPING MODE)
+    risk_percent: float = 1.0                              # 1% per trade (SL is tighter)
+    max_positions: int = 3                                  # Max 3 open per pair
+    max_daily_drawdown_pct: float = 5.0                     # Stop at 5% daily loss
+    max_weekly_drawdown_pct: float = 15.0                   # Stop at 15% weekly loss
+    max_consecutive_losses: int = 5                         # Pause after 5 losses
 
-    # Session filter (only trade volatile hours)
-    session_filter_enabled: bool = True                     # Only London/NY overlap
-    session_start_utc: int = 7                              # 07:00 UTC (London open)
-    session_end_utc: int = 22                               # 22:00 UTC (NY close)
+    # Session filter — SCALPING: London-NY overlap only (highest volatility)
+    session_filter_enabled: bool = True
+    session_start_utc: int = 12                             # 12:00 UTC (London-NY overlap)
+    session_end_utc: int = 16                               # 16:00 UTC (NY morning)
 
-    # Signal generation (pure indicators, no LSTM)
-    min_confidence: float = 0.40                            # Lower for pure indicators
-    ema200_trend_bias: float = 0.30                         # Strong trend filter
+    # Signal generation (pure indicators, scalping-optimized)
+    min_confidence: float = 0.50                            # Higher quality entries
+    ema200_trend_bias: float = 0.40                         # Stronger trend filter
 
-    # Trailing stop
+    # Trailing stop (aggressive profit lock)
     use_trailing_stop: bool = True
-    trailing_atr_mult: float = 1.0
-    trailing_activation: float = 2.0
+    trailing_atr_mult: float = 0.5                          # Tight trail
+    trailing_activation: float = 0.8                        # Activate early
+
+    # Scalping: no overnight positions
+    close_all_on_session_end: bool = True
 
     # Misc
     magic_number: int = 20240101

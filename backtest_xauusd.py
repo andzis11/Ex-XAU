@@ -1,9 +1,9 @@
 """
-backtest_xauusd.py — Standalone Backtest (SURVIVAL MODE)
+backtest_xauusd.py — Standalone Backtest (SCALPING MODE)
 =========================================================
 Strategy: Pure indicators (EMA/RSI/MACD/BB) + EMA200 trend filter
 NO LSTM — simpler, more consistent, more reliable.
-Pair    : XAU/USD (H1)
+Timeframe: M5 (scalping)
 Modal   : $500 (simulasi)
 
 Cara pakai:
@@ -30,28 +30,28 @@ import pandas as pd
 @dataclass
 class BacktestConfig:
     initial_balance: float = 500.0
-    risk_percent: float = 0.5              # SURVIVAL: 0.5% per trade
-    atr_sl_mult: float = 2.0
-    atr_tp_mult: float = 4.0
+    risk_percent: float = 1.0              # SCALPING: 1% per trade
+    atr_sl_mult: float = 1.0               # Tight SL
+    atr_tp_mult: float = 1.5               # Quick TP
     atr_period: int = 14
     ema_fast: int = 20
     ema_slow: int = 50
     rsi_period: int = 14
     rsi_ob: float = 65.0
     rsi_os: float = 35.0
-    min_confidence: float = 0.40           # Lower for pure indicators
-    max_spread_pips: float = 30.0
+    min_confidence: float = 0.50           # Higher quality entries
+    max_spread_pips: float = 25.0
     pip_value_per_lot: float = 10.0
     commission_per_lot: float = 7.0
     lot_size: float = 0.01
 
-    # Trailing stop
+    # Trailing stop (aggressive)
     use_trailing_stop: bool = True
-    trailing_atr_mult: float = 1.0
-    trailing_activation: float = 2.0
+    trailing_atr_mult: float = 0.5
+    trailing_activation: float = 0.8
 
     # EMA200 trend filter
-    ema200_trend_bias: float = 0.30
+    ema200_trend_bias: float = 0.40
 
 
 # ─────────────────────────────────────────────
@@ -542,29 +542,29 @@ def load_data(csv_path=None):
 # ─────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Backtest Ex-XAU (SURVIVAL MODE)")
+    parser = argparse.ArgumentParser(description="Backtest Ex-XAU (SCALPING MODE)")
     parser.add_argument("--csv",      type=str,   default=None)
     parser.add_argument("--balance",  type=float, default=500.0)
-    parser.add_argument("--risk",     type=float, default=0.5,   help="Risk % (SURVIVAL: 0.5)")
-    parser.add_argument("--atr-sl",   type=float, default=2.0)
-    parser.add_argument("--atr-tp",   type=float, default=4.0)
-    parser.add_argument("--conf",     type=float, default=0.40)
+    parser.add_argument("--risk",     type=float, default=1.0,   help="Risk % (SCALPING: 1.0)")
+    parser.add_argument("--atr-sl",   type=float, default=1.0)
+    parser.add_argument("--atr-tp",   type=float, default=1.5)
+    parser.add_argument("--conf",     type=float, default=0.50)
     parser.add_argument("--no-tsl",   action="store_true",       help="Disable trailing stop")
-    parser.add_argument("--tsl-mult", type=float, default=1.0)
-    parser.add_argument("--tsl-act",  type=float, default=2.0)
+    parser.add_argument("--tsl-mult", type=float, default=0.5)
+    parser.add_argument("--tsl-act",  type=float, default=0.8)
     parser.add_argument("--out",      type=str,   default="results/backtest_xauusd.json")
     args = parser.parse_args()
 
     print("\n" + "=" * 52)
-    print("  EX-XAU BACKTEST — SURVIVAL MODE")
-    print("  Pure indicators (no LSTM)")
+    print("  EX-XAU BACKTEST — SCALPING MODE")
+    print("  Pure indicators (no LSTM) | M5 timeframe")
     print("=" * 52)
     print(f"  Modal    : ${args.balance}")
-    print(f"  Risk/trd : {args.risk}% (SURVIVAL)")
+    print(f"  Risk/trd : {args.risk}% (SCALPING)")
     print(f"  SL mult  : {args.atr_sl}× ATR")
     print(f"  TP mult  : {args.atr_tp}× ATR")
     print(f"  Min conf : {args.conf*100:.0f}%")
-    print(f"  Trailing : {'OFF' if args.no_tsl else 'ON'}")
+    print(f"  Trailing : {'OFF' if args.no_tsl else 'ON'} (act={args.tsl_act}×, trail={args.tsl_mult}×)")
 
     cfg = BacktestConfig(
         initial_balance=args.balance,
