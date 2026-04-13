@@ -24,23 +24,23 @@ class PairParams:
 PAIR_CONFIG: Dict[str, PairParams] = {
     "XAUUSD": PairParams(
         timeframe="M15",
-        atr_sl_multiplier=1.5,
-        atr_tp_multiplier=3.0,
+        atr_sl_multiplier=2.0,       # OPTIMIZED: 2.0 (was 1.5)
+        atr_tp_multiplier=4.0,       # OPTIMIZED: 4.0 (was 3.0)
         max_lot=1.0,
         risk_percent=1.0,
-        min_confidence=0.70,
+        min_confidence=0.55,         # OPTIMIZED: 55% (was 70%)
         max_spread_points=30,
-        pip_value_per_lot=10.0,     # $10 per pip per lot
+        pip_value_per_lot=10.0,
     ),
     "BTCUSD": PairParams(
         timeframe="H1",
-        atr_sl_multiplier=2.0,
-        atr_tp_multiplier=4.0,
+        atr_sl_multiplier=2.5,       # OPTIMIZED: 2.5 (was 2.0)
+        atr_tp_multiplier=5.0,       # OPTIMIZED: 5.0 (was 4.0)
         max_lot=0.1,
         risk_percent=0.5,
-        min_confidence=0.75,
+        min_confidence=0.60,         # OPTIMIZED: 60% (was 75%)
         max_spread_points=50,
-        pip_value_per_lot=1.0,      # $1 per pip per lot
+        pip_value_per_lot=1.0,
     ),
 }
 
