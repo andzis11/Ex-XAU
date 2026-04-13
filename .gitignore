@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.gitattributes
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Credentials (NEVER commit these)
+config/secrets.py
+*.pem
+*.key
+
+# Data & Models
+data/historical/
+data/*.db
+data/*.sqlite
+models/saved_models/*.h5
+models/saved_models/*.pkl
+models/saved_models/*.pb
+
+# Logs
+logs/
+
+# Results
+results/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# TensorFlow
+.checkpoint
+events.out.tfevents.*
+model.ckpt*
