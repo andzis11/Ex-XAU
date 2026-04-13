@@ -12,6 +12,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
+import requests
 import MetaTrader5 as mt5
 import numpy as np
 
@@ -30,6 +31,7 @@ from strategy.risk_manager import RiskManager
 from strategy.backtester import StrategyBacktester
 from monitoring.logger import setup_logger, TradeLogger
 from monitoring.notifier import TelegramNotifier
+from monitoring.telegram_commands import TelegramCommands
 
 # ============================================================================
 # State Machine
@@ -145,6 +147,24 @@ class TradingBot:
         self._cycle_count = 0
         self._news_filter = NewsFilter()
 
+        # Mutable runtime parameters (shared with Telegram commands)
+        self._params = {
+            "use_trailing_stop": True,
+            "tsl_activation": 2.5,
+            "tsl_atr_mult": 1.5,
+            "risk_percent": 1.0,
+            "min_confidence": 0.55,
+            "max_positions": 3,
+            "atr_sl_mult": 2.0,
+            "atr_tp_mult": 4.0,
+            "paused": False,
+            "cycle_count": 0,
+            "balance": 0.0,
+            "daily_dd": 0.0,
+        }
+        self._cmd_handler: Optional[TelegramCommands] = None
+        self._last_update_id = 0
+
     # ---- Lifecycle ----
 
     def initialize(self) -> bool:
@@ -197,12 +217,19 @@ class TradingBot:
         self.portfolio = Portfolio()
         self.portfolio.refresh()
 
-        # 7. Initialize notifier
+        # 7. Initialize notifier & command handler
         self.notifier = TelegramNotifier(
             bot_token=self.config.telegram.bot_token,
             chat_id=self.config.telegram.chat_id,
             enabled=self.config.telegram.enabled,
         )
+
+        if self.config.telegram.enabled and self.config.telegram.bot_token:
+            self._cmd_handler = TelegramCommands(
+                bot_token=self.config.telegram.bot_token,
+                chat_id=self.config.telegram.chat_id,
+            )
+            self.logger.info("Telegram command handler initialized")
 
         self.sm.transition(BotState.RUNNING)
         self._running = True
@@ -255,8 +282,20 @@ class TradingBot:
 
         try:
             while self._running and self.sm.is_active():
+                # Poll Telegram commands
+                self._poll_telegram_commands()
+
+                # Check if Telegram paused the bot
+                if self._params.get("paused", False) and self.sm.state != BotState.PAUSED:
+                    self.pause(reason="Paused via Telegram")
+                    continue
+
+                if self._params.get("paused", False):
+                    time.sleep(60)
+                    continue
+
                 if self.sm.state == BotState.PAUSED:
-                    time.sleep(60)  # Check every minute if we should resume
+                    time.sleep(60)
                     continue
 
                 self._cycle()
@@ -297,8 +336,14 @@ class TradingBot:
 
         # Update balance without resetting RiskManager state
         balance = self.broker.get_account_balance()
+        self._params["balance"] = balance
         self.risk.update_balance(balance)
         self.risk.reset_daily_tracking()
+        self._params["daily_dd"] = self.risk.daily_drawdown_pct
+
+        # Apply dynamic params from Telegram
+        max_pos = self._params.get("max_positions", self.config.bot.max_positions)
+        min_conf = self._params.get("min_confidence", self.config.bot.min_confidence)
 
         # Check daily drawdown limit
         if self.risk.daily_drawdown_pct >= self.config.bot.max_daily_drawdown_pct:
@@ -324,6 +369,14 @@ class TradingBot:
 
         pair_params = get_pair_params(symbol)
 
+        # Override pair params with dynamic Telegram settings
+        dynamic_conf = self._params.get("min_confidence")
+        dynamic_sl = self._params.get("atr_sl_mult")
+        dynamic_tp = self._params.get("atr_tp_mult")
+        use_tsl = self._params.get("use_trailing_stop", True)
+        tsl_act = self._params.get("tsl_activation", 2.5)
+        tsl_mult = self._params.get("tsl_atr_mult", 1.5)
+
         # 1. Fetch data + indicators
         df = self.collector.get_indicators(symbol, pair_params.timeframe, bars=500)
         if df is None or len(df) < 60:
@@ -341,24 +394,29 @@ class TradingBot:
             self.notifier.notify_spread_warning(symbol, tick["spread"])
             return
 
-        # 4. Check position limits
+        # 4. Check position limits (use dynamic max_positions)
+        max_pos = self._params.get("max_positions", self.config.bot.max_positions)
         open_pos = self.portfolio.get_positions_for_symbol(symbol)
-        if not self.risk.is_trade_allowed(symbol, open_pos, self.config.bot.max_positions):
+        if not self.risk.is_trade_allowed(symbol, open_pos, max_pos):
             return
 
-        # 5. Generate signal
+        # 5. Generate signal (apply dynamic min confidence)
         signal: TradeSignal = self.signal_gen.generate(symbol, df)
 
         self.trade_log.log_signal(
             symbol, signal.direction, signal.confidence, signal.entry_price
         )
 
-        if not signal.is_valid:
+        # Apply dynamic confidence threshold
+        effective_conf = dynamic_conf if dynamic_conf else pair_params.min_confidence
+        if not signal.is_valid or signal.confidence < effective_conf:
             self.logger.info(
                 f"{symbol}: No trade — {signal.direction} "
-                f"(confidence: {signal.confidence:.0%})"
+                f"(confidence: {signal.confidence:.0%} < {effective_conf:.0%})"
             )
             return
+
+        self.logger.info(f"  TSL: {'ON' if use_tsl else 'OFF'} (act={tsl_act}×, trail={tsl_mult}×)")
 
         # 6. Calculate lot size
         entry = signal.entry_price
@@ -399,6 +457,47 @@ class TradingBot:
         sig_name = signal.Signals(signum).name
         self.logger.info(f"Received {sig_name}. Shutting down...")
         self._running = False
+
+    def _poll_telegram_commands(self):
+        """Check for new Telegram commands and process them."""
+        if not self._cmd_handler:
+            return
+
+        try:
+            url = f"{self._cmd_handler.api_base}/getUpdates"
+            params = {
+                "offset": self._last_update_id + 1,
+                "timeout": 1,
+                "allowed_updates": ["message"],
+            }
+            resp = requests.get(url, params=params, timeout=5)
+            if resp.status_code != 200:
+                return
+
+            data = resp.json()
+            if not data.get("ok") or "result" not in data:
+                return
+
+            for update in data["result"]:
+                self._last_update_id = update["update_id"]
+                message = update.get("message", {})
+                text = message.get("text", "")
+
+                if not text:
+                    continue
+
+                command, args = self._cmd_handler.parse_command(text)
+                if command:
+                    self._params["cycle_count"] = self._cycle_count
+                    self._params["balance"] = self.broker.get_account_balance() if self.broker else 0
+                    self._params["daily_dd"] = self.risk.daily_drawdown_pct if self.risk else 0
+
+                    response = self._cmd_handler.handle_command(command, args, self._params)
+                    self._cmd_handler.send_message(response)
+                    self.logger.info(f"Telegram command: /{command} → {response[:50]}")
+
+        except Exception as e:
+            self.logger.debug(f"Telegram command poll error: {e}")
 
     # ---- Utilities ----
 

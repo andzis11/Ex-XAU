@@ -51,6 +51,11 @@ class BacktestConfig:
     use_ema200_filter: bool = True       # OPTIMIZED: ON
     trend_bias: float = 0.30             # OPTIMIZED: 0.30
 
+    # Trailing Stop settings
+    use_trailing_stop: bool = True       # Use trailing stop after TP distance reached
+    trailing_atr_mult: float = 1.0       # Trail distance = ATR × this multiplier
+    trailing_activation: float = 1.5     # Activate trailing stop after price moves this × ATR in profit
+
 
 # ─────────────────────────────────────────────
 # 2. INDICATORS
@@ -206,6 +211,11 @@ class Trade:
     net_pnl: float = 0.0
     confidence: float = 0.0
     reasons: List[str] = field(default_factory=list)
+    # Trailing stop state
+    tsl_active: bool = False
+    tsl_price: float = 0.0             # Current trailing stop price
+    max_profit: float = 0.0             # Track max unrealized profit
+    atr_at_entry: float = 0.0           # ATR at entry for dynamic trailing
 
 
 # ─────────────────────────────────────────────
@@ -286,43 +296,110 @@ class Backtest:
             lot=lot,
             confidence=sig["confidence"],
             reasons=sig["reasons"],
+            atr_at_entry=atr,
+            tsl_price=sl,              # TSL starts at original SL
+            max_profit=0.0,
+            tsl_active=False,
         )
         self.trade_idx += 1
 
     def _check_exit(self, row, ts):
         t = self.open_trade
-        hit_sl = hit_tp = False
+        cfg = self.cfg
+        current_price = row["close"]
+        high = row["high"]
+        low = row["low"]
+        atr = row.get("atr", t.atr_at_entry)
 
+        # ── Update trailing stop ──
+        if cfg.use_trailing_stop:
+            # Calculate current profit distance
+            if t.direction == "BUY":
+                profit_dist = current_price - t.entry
+                peak_price = max(high, t.entry + t.max_profit) if t.max_profit > 0 else high
+            else:
+                profit_dist = t.entry - current_price
+                peak_price = min(low, t.entry - t.max_profit) if t.max_profit > 0 else low
+
+            # Track max profit in price terms
+            if t.direction == "BUY":
+                t.max_profit = max(t.max_profit, current_price - t.entry)
+            else:
+                t.max_profit = max(t.max_profit, t.entry - current_price)
+
+            # Activate trailing stop after threshold
+            activation_dist = atr * cfg.trailing_activation
+            if not t.tsl_active and profit_dist >= activation_dist:
+                t.tsl_active = True
+                # Set initial TSL at breakeven or original SL (whichever is better)
+                if t.direction == "BUY":
+                    t.tsl_price = max(t.sl, t.entry)
+                else:
+                    t.tsl_price = min(t.sl, t.entry)
+
+            # Trail the stop if active
+            if t.tsl_active:
+                trail_dist = atr * cfg.trailing_atr_mult
+                if t.direction == "BUY":
+                    new_tsl = peak_price - trail_dist
+                    if new_tsl > t.tsl_price:
+                        t.tsl_price = new_tsl
+                else:
+                    new_tsl = peak_price + trail_dist
+                    if new_tsl < t.tsl_price:
+                        t.tsl_price = new_tsl
+
+        # ── Check if TSL hit ──
+        hit_tsl = False
+        if t.tsl_active:
+            if t.direction == "BUY" and low <= t.tsl_price:
+                hit_tsl = True
+                exit_p = t.tsl_price
+            elif t.direction == "SELL" and high >= t.tsl_price:
+                hit_tsl = True
+                exit_p = t.tsl_price
+
+        if hit_tsl:
+            t.exit_price = exit_p
+            t.exit_time = ts
+            t.exit_reason = "TSL"
+            self._close_trade(t, exit_p, ts)
+            return
+
+        # ── Check original SL ──
+        hit_sl = False
         if t.direction == "BUY":
-            if row["low"] <= t.sl:
-                hit_sl = True
-                exit_p = t.sl
-            elif row["high"] >= t.tp:
-                hit_tp = True
-                exit_p = t.tp
+            if low <= t.sl:
+                hit_sl = True; exit_p = t.sl
+            elif high >= t.tp:
+                t.exit_price = t.tp; t.exit_time = ts; t.exit_reason = "TP"
+                self._close_trade(t, t.tp, ts)
+                return
             else:
                 return
         else:
-            if row["high"] >= t.sl:
-                hit_sl = True
-                exit_p = t.sl
-            elif row["low"] <= t.tp:
-                hit_tp = True
-                exit_p = t.tp
+            if high >= t.sl:
+                hit_sl = True; exit_p = t.sl
+            elif low <= t.tp:
+                t.exit_price = t.tp; t.exit_time = ts; t.exit_reason = "TP"
+                self._close_trade(t, t.tp, ts)
+                return
             else:
                 return
 
         t.exit_price = exit_p
-        t.exit_time  = ts
-        t.exit_reason = "SL" if hit_sl else "TP"
+        t.exit_time = ts
+        t.exit_reason = "SL" if hit_sl else "TSL"
+        self._close_trade(t, exit_p, ts)
 
+    def _close_trade(self, t, exit_p, ts):
+        """Calculate P&L and close trade."""
         pip_dist = (exit_p - t.entry) if t.direction == "BUY" else (t.entry - exit_p)
         gross_pnl = pip_dist * self.cfg.pip_value_per_lot * t.lot / 0.01
         commission = self.cfg.commission_per_lot * t.lot
-        t.pnl       = round(gross_pnl, 2)
+        t.pnl = round(gross_pnl, 2)
         t.commission = round(commission, 2)
-        t.net_pnl   = round(gross_pnl - commission, 2)
-
+        t.net_pnl = round(gross_pnl - commission, 2)
         self.balance += t.net_pnl
         self.trades.append(t)
         self.open_trade = None
@@ -400,13 +477,21 @@ class BacktestResult:
         # Daily stats
         df_t = pd.DataFrame([{
             "date": str(x.time)[:10],
-            "pnl": x.net_pnl
+            "pnl": x.net_pnl,
+            "exit_reason": getattr(x, "exit_reason", "N/A"),
         } for x in t])
         daily = df_t.groupby("date")["pnl"].sum()
         self.avg_daily_pnl  = daily.mean() if len(daily) else 0
         self.best_day       = daily.max() if len(daily) else 0
         self.worst_day      = daily.min() if len(daily) else 0
         self.days_traded    = len(daily)
+
+        # Exit reason breakdown
+        exit_reasons = df_t["exit_reason"].value_counts().to_dict()
+        self.exit_by_sl  = exit_reasons.get("SL", 0)
+        self.exit_by_tp  = exit_reasons.get("TP", 0)
+        self.exit_by_tsl = exit_reasons.get("TSL", 0)
+        self.exit_by_end = exit_reasons.get("END", 0)
 
     def print_report(self):
         final_balance = self.initial_balance + self.net_profit
@@ -435,6 +520,15 @@ class BacktestResult:
         print(f"  Hari terbaik   : ${self.best_day:>+.2f}")
         print(f"  Hari terburuk  : ${self.worst_day:>+.2f}")
         print(f"{sep}")
+
+        # Exit breakdown
+        if hasattr(self, "exit_by_tsl"):
+            print(f"  Exit Breakdown:")
+            print(f"    SL hit    : {self.exit_by_sl}")
+            print(f"    TP hit    : {self.exit_by_tp}")
+            print(f"    TSL hit   : {self.exit_by_tsl}")
+            print(f"    End/BT    : {self.exit_by_end}")
+            print(f"{sep}")
 
         # Assessment
         print(f"\n  ASSESSMENT:")
@@ -542,6 +636,9 @@ def main():
     parser.add_argument("--rsi-ob",    type=float, default=65.0,  help="RSI overbought (OPTIMIZED: 65)")
     parser.add_argument("--no-ema200", action="store_true",       help="Disable EMA200 trend filter")
     parser.add_argument("--bias",      type=float, default=0.30,  help="Trend bias (OPTIMIZED: 0.30)")
+    parser.add_argument("--no-tsl",    action="store_true",       help="Disable trailing stop")
+    parser.add_argument("--tsl-mult",  type=float, default=1.0,   help="Trailing ATR multiplier (default: 1.0)")
+    parser.add_argument("--tsl-act",   type=float, default=1.5,   help="Trailing activation × ATR (default: 1.5)")
     parser.add_argument("--out",       type=str,   default="results/backtest_xauusd.json")
     args = parser.parse_args()
 
@@ -553,6 +650,7 @@ def main():
     print(f"  SL mult  : {args.atr_sl}× ATR")
     print(f"  TP mult  : {args.atr_tp}× ATR")
     print(f"  Min conf : {args.conf*100:.0f}%")
+    print(f"  Trailing : {'ON' if not args.no_tsl else 'OFF'} (act={args.tsl_act}×, trail={args.tsl_mult}× ATR)")
 
     cfg = BacktestConfig(
         initial_balance=args.balance,
@@ -564,6 +662,9 @@ def main():
         rsi_ob=args.rsi_ob,
         use_ema200_filter=not args.no_ema200,
         trend_bias=args.bias,
+        use_trailing_stop=not args.no_tsl,
+        trailing_atr_mult=args.tsl_mult,
+        trailing_activation=args.tsl_act,
     )
 
     df     = load_data(args.csv)
