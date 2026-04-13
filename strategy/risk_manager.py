@@ -36,6 +36,39 @@ class RiskManager:
         """
         self.balance = account_balance
         self.risk_percent = risk_percent
+        self._daily_pnl = 0.0
+        self._daily_trades = 0
+        self._trade_history = []
+
+    def update_balance(self, new_balance: float):
+        """Update account balance without resetting internal state."""
+        self.balance = new_balance
+
+    def record_trade(self, pnl: float):
+        """Record a closed trade for daily tracking."""
+        self._daily_pnl += pnl
+        self._daily_trades += 1
+        self._trade_history.append(pnl)
+
+    @property
+    def daily_drawdown(self) -> float:
+        """Current daily drawdown (negative value if losing)."""
+        return self._daily_pnl if self._daily_pnl < 0 else 0.0
+
+    @property
+    def daily_drawdown_pct(self) -> float:
+        """Daily drawdown as percentage of balance."""
+        if self.balance <= 0:
+            return 0.0
+        return abs(self.daily_drawdown) / self.balance * 100
+
+    def reset_daily_tracking(self):
+        """Reset daily P&L tracking (call at start of each trading day)."""
+        from datetime import date
+        if not hasattr(self, '_last_reset_date') or self._last_reset_date != date.today():
+            self._daily_pnl = 0.0
+            self._daily_trades = 0
+            self._last_reset_date = date.today()
 
     def calculate_lot_size(
         self,

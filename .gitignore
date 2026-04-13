@@ -54,6 +54,7 @@ results/
 # OS
 .DS_Store
 Thumbs.db
+$null
 
 # TensorFlow
 .checkpoint

@@ -166,6 +166,15 @@ class TelegramNotifier:
         )
         self._send(text)
 
+    def notify_daily_drawdown(self, drawdown_pct: float):
+        """Alert when daily drawdown exceeds limit."""
+        text = (
+            f"🛑 *DAILY DRAWDOWN LIMIT*\n\n"
+            f"Drawdown: `{drawdown_pct:.1f}%`\n"
+            f"Trading paused until tomorrow."
+        )
+        self._send(text)
+
     def test(self) -> bool:
         """Send a test message to verify connection."""
         return self._send("✅ Bot connection test successful!")

@@ -33,6 +33,7 @@ class BotConfig:
     min_confidence: float = 0.70                            # Min 70% for entry
     risk_percent: float = 1.0                               # Risk per trade
     max_positions: int = 3                                  # Max open positions per pair
+    max_daily_drawdown_pct: float = 5.0                     # Max daily loss %
     magic_number: int = 20240101
     deviation: int = 20                                     # Slippage tolerance in points
     db_path: str = "data/trading_journal.db"

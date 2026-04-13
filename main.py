@@ -22,6 +22,7 @@ from execution.broker import ExnessBroker
 from execution.order_manager import OrderManager
 from execution.portfolio import Portfolio
 from data.collector import DataCollector
+from data.news_filter import NewsFilter
 from models.trainer import LSTMTrainer
 from models.predictor import LSTMPredictor
 from strategy.signal_generator import SignalGenerator, TradeSignal
@@ -142,6 +143,7 @@ class TradingBot:
         # Runtime
         self._running = False
         self._cycle_count = 0
+        self._news_filter = NewsFilter()
 
     # ---- Lifecycle ----
 
@@ -167,6 +169,15 @@ class TradingBot:
         trainer = LSTMTrainer(model_dir=self.config.bot.model_dir)
         loaded = trainer.load_all_models()
         self.logger.info(f"Loaded {loaded} LSTM model(s)")
+
+        # Hard stop if no models loaded — bot cannot trade without predictions
+        if loaded == 0:
+            self.logger.error(
+                "CRITICAL: No LSTM models loaded! "
+                "Run `python main.py train` first to train models. Exiting."
+            )
+            self.sm.transition(BotState.ERROR)
+            return False
 
         self.predictor = LSTMPredictor()
         for symbol in get_all_pairs():
@@ -268,12 +279,36 @@ class TradingBot:
         self.logger.info(f"  Cycle #{self._cycle_count} | {datetime.now().isoformat()}")
         self.logger.info(f"{'='*50}")
 
+        # Check news blackout before trading
+        is_blackout, reason = self._news_filter.check_blackout("XAUUSD")
+        if is_blackout:
+            self.logger.warning(f"NEWS BLACKOUT: {reason}")
+            if self.sm.state != BotState.PAUSED:
+                self.pause(reason=reason)
+            return
+
+        # Auto-resume if was paused for news and blackout ended
+        if self.sm.state == BotState.PAUSED and not is_blackout:
+            self.logger.info("News blackout ended. Resuming trading.")
+            self.resume()
+
         # Refresh portfolio
         self.portfolio.refresh()
 
-        # Refresh account balance for risk calculations
+        # Update balance without resetting RiskManager state
         balance = self.broker.get_account_balance()
-        self.risk = RiskManager(balance, self.config.bot.risk_percent)
+        self.risk.update_balance(balance)
+        self.risk.reset_daily_tracking()
+
+        # Check daily drawdown limit
+        if self.risk.daily_drawdown_pct >= self.config.bot.max_daily_drawdown_pct:
+            self.logger.warning(
+                f"Daily drawdown {self.risk.daily_drawdown_pct:.1f}% "
+                f"exceeds limit {self.config.bot.max_daily_drawdown_pct}%. Pausing."
+            )
+            self.notifier.notify_daily_drawdown(self.risk.daily_drawdown_pct)
+            self.pause(reason=f"Daily DD {self.risk.daily_drawdown_pct:.1f}%")
+            return
 
         for symbol in get_all_pairs():
             self._process_pair(symbol)
@@ -328,7 +363,9 @@ class TradingBot:
         # 6. Calculate lot size
         entry = signal.entry_price
         sl = signal.stop_loss
-        sl_pips = abs(entry - sl) / max(df["atr"].iloc[-1], 0.001)
+
+        # Calculate actual pip distance (price difference)
+        sl_pips = abs(entry - sl)
         lot = self.risk.calculate_lot_size(symbol, sl_pips)
 
         self.logger.info(
@@ -438,15 +475,39 @@ def main():
         bot.shutdown()
 
     elif args.mode == "backtest":
-        # Backtest mode — loads data from CSV if available
+        # Backtest mode — loads data from CSV or falls back to yfinance
         import pandas as pd
         data_file = f"data/historical/{args.symbol}_H1.csv"
+
         if os.path.exists(data_file):
             df = pd.read_csv(data_file, index_col="time", parse_dates=True)
             bot.run_backtest(args.symbol, df)
         else:
             print(f"No historical data found at {data_file}")
-            print("Run `python main.py train` first to download data.")
+            print("Attempting to fetch data via yfinance fallback...")
+
+            try:
+                import yfinance as yf
+                # Map symbols to yfinance tickers
+                yf_map = {"XAUUSD": "GC=F", "BTCUSD": "BTC-USD"}
+                yf_ticker = yf_map.get(args.symbol, args.symbol)
+
+                ticker = yf.Ticker(yf_ticker)
+                df = ticker.history(period="2y", interval="1h")
+                df.index.name = "time"
+
+                if not df.empty:
+                    os.makedirs("data/historical", exist_ok=True)
+                    df.to_csv(data_file)
+                    print(f"Data saved to {data_file}. Run backtest again.")
+                else:
+                    print(f"Failed to fetch data for {yf_ticker}")
+            except ImportError:
+                print("yfinance not installed. Install with: pip install yfinance")
+                print("Or run `python main.py train` first to download data.")
+            except Exception as e:
+                print(f"Error fetching data: {e}")
+                print("Run `python main.py train` first to download data.")
 
     elif args.mode == "train":
         # Train mode — fetches data and trains LSTM models
