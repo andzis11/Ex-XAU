@@ -1,6 +1,7 @@
 """
-Exness AI Trading Bot — Main Entry Point.
-Orchestrates all layers with a state machine and 15-minute schedule.
+Exness AI Trading Bot — Main Entry Point (SURVIVAL MODE).
+Pure indicator-based strategy. No LSTM dependency.
+Orchestrates all layers with a state machine and session-aware scheduling.
 """
 
 import logging
@@ -24,14 +25,12 @@ from execution.order_manager import OrderManager
 from execution.portfolio import Portfolio
 from data.collector import DataCollector
 from data.news_filter import NewsFilter
-from models.trainer import LSTMTrainer
-from models.predictor import LSTMPredictor
 from strategy.signal_generator import SignalGenerator, TradeSignal
 from strategy.risk_manager import RiskManager
 from strategy.backtester import StrategyBacktester
 from monitoring.logger import setup_logger, TradeLogger
 from monitoring.notifier import TelegramNotifier
-from monitoring.telegram_commands import TelegramCommands
+from monitoring.telegram_commands import TelegramKeyboard
 
 # ============================================================================
 # State Machine
@@ -42,23 +41,14 @@ class BotState(Enum):
     INITIALIZING = "initializing"
     CONNECTED = "connected"
     RUNNING = "running"
-    PAUSED = "paused"         # Paused due to news/error
+    PAUSED = "paused"
     STOPPING = "stopping"
     STOPPED = "stopped"
     ERROR = "error"
 
 
 class BotStateMachine:
-    """
-    Manages bot state transitions.
-
-    State diagram:
-        INITIALIZING → CONNECTED → RUNNING ↔ PAUSED
-                                      ↓
-                                   STOPPING → STOPPED
-                                      ↓
-                                    ERROR → STOPPED
-    """
+    """Manages bot state transitions."""
 
     VALID_TRANSITIONS = {
         BotState.INITIALIZING: {BotState.CONNECTED, BotState.ERROR},
@@ -78,12 +68,7 @@ class BotStateMachine:
         return self._state
 
     def transition(self, new_state: BotState) -> bool:
-        """
-        Attempt state transition.
-
-        Returns:
-            True if transition was valid and executed
-        """
+        """Attempt state transition."""
         allowed = self.VALID_TRANSITIONS.get(self._state, set())
         if new_state not in allowed:
             logging.getLogger("ai_bot").warning(
@@ -104,26 +89,21 @@ class BotStateMachine:
 
 
 # ============================================================================
-# Main Bot
+# Main Bot (SURVIVAL MODE)
 # ============================================================================
 
 class TradingBot:
     """
-    Exness AI Trading Bot.
+    Exness AI Trading Bot — SURVIVAL MODE.
+    Pure indicator-based strategy with strict risk management.
 
-    Flow per cycle (every 15 minutes):
-        1. Refresh portfolio & account
-        2. For each pair (XAUUSD, BTCUSD):
-            a. Fetch OHLCV + indicators
-            b. LSTM prediction
-            c. Signal generation with indicator confirmation
-            d. Risk check (spread, positions, lot sizing)
-            e. Execute order
-        3. Log & notify
+    Key principles:
+    - Trend-following > prediction
+    - Survival > greed (0.5% risk per trade)
+    - Simple & proven > complex & fragile
     """
 
     def __init__(self):
-        # Config
         self.config = load_config()
         self.logger = setup_logger(self.config.bot.log_file, "INFO")
         self.trade_log = TradeLogger()
@@ -135,42 +115,46 @@ class TradingBot:
         # Components
         self.broker: Optional[ExnessBroker] = None
         self.collector: Optional[DataCollector] = None
-        self.predictor: Optional[LSTMPredictor] = None
         self.signal_gen: Optional[SignalGenerator] = None
         self.risk: Optional[RiskManager] = None
         self.order_mgr: Optional[OrderManager] = None
         self.portfolio: Optional[Portfolio] = None
         self.notifier: Optional[TelegramNotifier] = None
+        self._keyboard: Optional[TelegramKeyboard] = None
+
+        # Filters
+        self._news_filter: Optional[NewsFilter] = None
 
         # Runtime
         self._running = False
         self._cycle_count = 0
-        self._news_filter = NewsFilter()
+        self._last_update_id = 0
 
-        # Mutable runtime parameters (shared with Telegram commands)
+        # Mutable params (shared with Telegram)
         self._params = {
-            "use_trailing_stop": True,
-            "tsl_activation": 2.5,
-            "tsl_atr_mult": 1.5,
-            "risk_percent": 1.0,
-            "min_confidence": 0.55,
-            "max_positions": 3,
+            "use_trailing_stop": self.config.bot.use_trailing_stop,
+            "tsl_activation": self.config.bot.trailing_activation,
+            "tsl_atr_mult": self.config.bot.trailing_atr_mult,
+            "risk_percent": self.config.bot.risk_percent,
+            "min_confidence": self.config.bot.min_confidence,
+            "max_positions": self.config.bot.max_positions,
             "atr_sl_mult": 2.0,
             "atr_tp_mult": 4.0,
             "paused": False,
             "cycle_count": 0,
             "balance": 0.0,
             "daily_dd": 0.0,
+            "weekly_dd": 0.0,
+            "consecutive_losses": 0,
+            "session_name": "Off Hours",
         }
-        self._cmd_handler: Optional[TelegramCommands] = None
-        self._last_update_id = 0
 
     # ---- Lifecycle ----
 
     def initialize(self) -> bool:
         """Initialize all components and connect to MT5."""
         self.logger.info("=" * 60)
-        self.logger.info("  EXNESS AI TRADING BOT v2.0")
+        self.logger.info("  EXNESS AI TRADING BOT v3.0 — SURVIVAL MODE")
         self.logger.info("=" * 60)
 
         # 1. Connect to broker
@@ -185,39 +169,34 @@ class TradingBot:
         # 2. Initialize data collector
         self.collector = DataCollector()
 
-        # 3. Load LSTM models
-        trainer = LSTMTrainer(model_dir=self.config.bot.model_dir)
-        loaded = trainer.load_all_models()
-        self.logger.info(f"Loaded {loaded} LSTM model(s)")
+        # 3. Initialize signal generator (pure indicators, no LSTM)
+        self.signal_gen = SignalGenerator(
+            ema200_trend_bias=self.config.bot.ema200_trend_bias,
+            min_confidence=self.config.bot.min_confidence,
+        )
 
-        # Hard stop if no models loaded — bot cannot trade without predictions
-        if loaded == 0:
-            self.logger.error(
-                "CRITICAL: No LSTM models loaded! "
-                "Run `python main.py train` first to train models. Exiting."
-            )
-            self.sm.transition(BotState.ERROR)
-            return False
-
-        self.predictor = LSTMPredictor()
-        for symbol in get_all_pairs():
-            model = trainer.get_model(symbol)
-            if model:
-                self.predictor.load_model(symbol, model)
-
-        # 4. Initialize signal generator
-        self.signal_gen = SignalGenerator(self.predictor)
-
-        # 5. Initialize risk manager
+        # 4. Initialize risk manager
         balance = self.broker.get_account_balance()
-        self.risk = RiskManager(balance, self.config.bot.risk_percent)
+        self.risk = RiskManager(
+            account_balance=balance,
+            risk_percent=self.config.bot.risk_percent,
+            max_consecutive_losses=self.config.bot.max_consecutive_losses,
+            max_weekly_drawdown_pct=self.config.bot.max_weekly_drawdown_pct,
+        )
 
-        # 6. Initialize order manager & portfolio
+        # 5. Initialize order manager & portfolio
         self.order_mgr = OrderManager(self.config.bot)
         self.portfolio = Portfolio()
         self.portfolio.refresh()
 
-        # 7. Initialize notifier & command handler
+        # 6. Initialize news + session filter
+        self._news_filter = NewsFilter(
+            session_filter_enabled=self.config.bot.session_filter_enabled,
+            session_start_utc=self.config.bot.session_start_utc,
+            session_end_utc=self.config.bot.session_end_utc,
+        )
+
+        # 7. Initialize notifier & Telegram keyboard
         self.notifier = TelegramNotifier(
             bot_token=self.config.telegram.bot_token,
             chat_id=self.config.telegram.chat_id,
@@ -225,17 +204,23 @@ class TradingBot:
         )
 
         if self.config.telegram.enabled and self.config.telegram.bot_token:
-            self._cmd_handler = TelegramCommands(
+            self._keyboard = TelegramKeyboard(
                 bot_token=self.config.telegram.bot_token,
                 chat_id=self.config.telegram.chat_id,
             )
-            self.logger.info("Telegram command handler initialized")
+            self.logger.info("Telegram control panel initialized")
 
         self.sm.transition(BotState.RUNNING)
         self._running = True
 
         self.logger.info(f"Bot initialized. Pairs: {get_all_pairs()}")
-        self.trade_log.log_status("Bot started successfully")
+        self.logger.info("Strategy: Pure indicators (no LSTM)")
+        self.logger.info(f"Risk: {self.config.bot.risk_percent}% per trade")
+        self.logger.info(
+            f"Sessions: {self.config.bot.session_start_utc}:00-"
+            f"{self.config.bot.session_end_utc}:00 UTC"
+        )
+        self.trade_log.log_status("Bot started (SURVIVAL MODE)")
 
         # Send notification
         self.notifier.notify_bot_started(get_all_pairs())
@@ -256,36 +241,31 @@ class TradingBot:
         self.logger.info("Bot stopped.")
 
     def pause(self, reason: str = ""):
-        """Pause trading (e.g., during news)."""
+        """Pause trading."""
         self.sm.transition(BotState.PAUSED)
+        self._params["paused"] = True
         self.logger.warning(f"Bot PAUSED: {reason}")
 
     def resume(self):
         """Resume trading after pause."""
         self.sm.transition(BotState.RUNNING)
+        self._params["paused"] = False
         self.logger.info("Bot RESUMED")
 
     # ---- Main Loop ----
 
     def run(self, interval_minutes: int = 15):
-        """
-        Main event loop. Runs every N minutes.
-
-        Args:
-            interval_minutes: Seconds between cycles
-        """
-        # Register signal handlers
+        """Main event loop."""
         signal.signal(signal.SIGINT, lambda s, f: self._handle_signal(s))
         signal.signal(signal.SIGTERM, lambda s, f: self._handle_signal(s))
 
         self.logger.info(f"Starting main loop (interval: {interval_minutes} min)")
 
         # Show initial Telegram menu
-        if self._cmd_handler:
+        if self._keyboard:
             self._params["cycle_count"] = 0
             self._params["balance"] = self.broker.get_account_balance() if self.broker else 0
-            self._params["daily_dd"] = 0.0
-            self._cmd_handler.show_main_menu(self._params)
+            self._keyboard.show_main_menu(self._params)
             self.logger.info("Telegram control panel sent")
 
         try:
@@ -296,6 +276,7 @@ class TradingBot:
                 # Check if Telegram paused the bot
                 if self._params.get("paused", False) and self.sm.state != BotState.PAUSED:
                     self.pause(reason="Paused via Telegram")
+                    time.sleep(60)
                     continue
 
                 if self._params.get("paused", False):
@@ -309,7 +290,7 @@ class TradingBot:
                 self._cycle()
                 self._cycle_count += 1
 
-                # Sleep in small increments for responsive shutdown
+                # Sleep in small increments
                 for _ in range(interval_minutes * 60):
                     if not self._running:
                         break
@@ -326,47 +307,44 @@ class TradingBot:
         self.logger.info(f"  Cycle #{self._cycle_count} | {datetime.now().isoformat()}")
         self.logger.info(f"{'='*50}")
 
-        # Check news blackout before trading
+        # Check session + news blackout
         is_blackout, reason = self._news_filter.check_blackout("XAUUSD")
         if is_blackout:
-            self.logger.warning(f"NEWS BLACKOUT: {reason}")
+            self.logger.info(f"FILTER: {reason}")
             if self.sm.state != BotState.PAUSED:
                 self.pause(reason=reason)
             return
 
-        # Auto-resume if was paused for news and blackout ended
+        # Auto-resume if was paused for session/news and now clear
         if self.sm.state == BotState.PAUSED and not is_blackout:
-            self.logger.info("News blackout ended. Resuming trading.")
+            self.logger.info("Filter cleared. Resuming trading.")
             self.resume()
 
         # Refresh portfolio
         self.portfolio.refresh()
 
-        # Update balance without resetting RiskManager state
+        # Update balance & risk tracking
         balance = self.broker.get_account_balance()
         self._params["balance"] = balance
         self.risk.update_balance(balance)
         self.risk.reset_daily_tracking()
         self._params["daily_dd"] = self.risk.daily_drawdown_pct
+        self._params["weekly_dd"] = self.risk.weekly_drawdown_pct
+        self._params["consecutive_losses"] = self.risk.consecutive_losses
+        self._params["session_name"] = self._news_filter.get_session_name()
 
-        # Apply dynamic params from Telegram
-        max_pos = self._params.get("max_positions", self.config.bot.max_positions)
-        min_conf = self._params.get("min_confidence", self.config.bot.min_confidence)
-
-        # Check daily drawdown limit
-        if self.risk.daily_drawdown_pct >= self.config.bot.max_daily_drawdown_pct:
-            self.logger.warning(
-                f"Daily drawdown {self.risk.daily_drawdown_pct:.1f}% "
-                f"exceeds limit {self.config.bot.max_daily_drawdown_pct}%. Pausing."
-            )
-            self.notifier.notify_daily_drawdown(self.risk.daily_drawdown_pct)
-            self.pause(reason=f"Daily DD {self.risk.daily_drawdown_pct:.1f}%")
+        # Check risk limits (consecutive losses, daily/weekly DD)
+        should_pause, pause_reason = self.risk.should_pause
+        if should_pause:
+            self.logger.warning(f"RISK LIMIT: {pause_reason}. Pausing.")
+            self.notifier.send(f"⚠️ Risk limit hit: {pause_reason}. Bot paused.")
+            self.pause(reason=pause_reason)
             return
 
         for symbol in get_all_pairs():
             self._process_pair(symbol)
 
-        # Log portfolio summary
+        # Portfolio summary
         summary = self.portfolio.summary()
         self.logger.info(f"Portfolio: {summary['total_positions']} positions | "
                         f"PnL: ${summary['total_pnl']:.2f}")
@@ -376,14 +354,6 @@ class TradingBot:
         self.logger.info(f"\n--- {symbol} ---")
 
         pair_params = get_pair_params(symbol)
-
-        # Override pair params with dynamic Telegram settings
-        dynamic_conf = self._params.get("min_confidence")
-        dynamic_sl = self._params.get("atr_sl_mult")
-        dynamic_tp = self._params.get("atr_tp_mult")
-        use_tsl = self._params.get("use_trailing_stop", True)
-        tsl_act = self._params.get("tsl_activation", 2.5)
-        tsl_mult = self._params.get("tsl_atr_mult", 1.5)
 
         # 1. Fetch data + indicators
         df = self.collector.get_indicators(symbol, pair_params.timeframe, bars=500)
@@ -402,13 +372,13 @@ class TradingBot:
             self.notifier.notify_spread_warning(symbol, tick["spread"])
             return
 
-        # 4. Check position limits (use dynamic max_positions)
+        # 4. Check position limits
         max_pos = self._params.get("max_positions", self.config.bot.max_positions)
         open_pos = self.portfolio.get_positions_for_symbol(symbol)
         if not self.risk.is_trade_allowed(symbol, open_pos, max_pos):
             return
 
-        # 5. Generate signal (apply dynamic min confidence)
+        # 5. Generate signal (pure indicators)
         signal: TradeSignal = self.signal_gen.generate(symbol, df)
 
         self.trade_log.log_signal(
@@ -416,33 +386,37 @@ class TradingBot:
         )
 
         # Apply dynamic confidence threshold
-        effective_conf = dynamic_conf if dynamic_conf else pair_params.min_confidence
+        effective_conf = self._params.get("min_confidence", pair_params.min_confidence)
         if not signal.is_valid or signal.confidence < effective_conf:
             self.logger.info(
                 f"{symbol}: No trade — {signal.direction} "
-                f"(confidence: {signal.confidence:.0%} < {effective_conf:.0%})"
+                f"(score: {signal.confidence:.2f} < {effective_conf:.2f})"
             )
             return
 
-        self.logger.info(f"  TSL: {'ON' if use_tsl else 'OFF'} (act={tsl_act}×, trail={tsl_mult}×)")
+        self.logger.info(
+            f"  TSL: {'ON' if self._params.get('use_trailing_stop', True) else 'OFF'} "
+            f"(act={self._params.get('tsl_activation', 2.0)}×, "
+            f"trail={self._params.get('tsl_atr_mult', 1.0)}×)"
+        )
 
         # 6. Calculate lot size
         entry = signal.entry_price
         sl = signal.stop_loss
-
-        # Calculate actual pip distance (price difference)
-        sl_pips = abs(entry - sl)
-        lot = self.risk.calculate_lot_size(symbol, sl_pips)
+        sl_distance = abs(entry - sl)
+        lot = self.risk.calculate_lot_size(symbol, sl_distance)
 
         self.logger.info(
             f"{symbol}: SIGNAL {signal.direction} | "
-            f"conf={signal.confidence:.0%} | lot={lot} | "
+            f"score={signal.confidence:.2f} | lot={lot} | "
             f"entry={entry} | SL={sl} | TP={signal.take_profit}"
         )
         self.logger.info(f"  Reasons: {'; '.join(signal.reasons)}")
 
         # 7. Execute order
-        result = self.order_mgr.open_order(symbol, signal.direction, lot, sl, signal.take_profit)
+        result = self.order_mgr.open_order(
+            symbol, signal.direction, lot, sl, signal.take_profit
+        )
 
         if result:
             self.trade_log.log_order(
@@ -453,26 +427,20 @@ class TradingBot:
                 symbol, signal.direction, signal.confidence,
                 entry, sl, signal.take_profit, lot,
             )
-
-            # Refresh portfolio
             self.portfolio.refresh()
         else:
             self.trade_log.log_error(f"{symbol}: Order execution failed")
             self.notifier.notify_error(f"Failed to execute {symbol} {signal.direction}")
 
-    def _handle_signal(self, signum):
-        """Handle OS signals for graceful shutdown."""
-        sig_name = signal.Signals(signum).name
-        self.logger.info(f"Received {sig_name}. Shutting down...")
-        self._running = False
+    # ---- Telegram ----
 
     def _poll_telegram_commands(self):
-        """Check for Telegram button presses and process them."""
-        if not self._cmd_handler:
+        """Check for Telegram button presses."""
+        if not self._keyboard:
             return
 
         try:
-            url = f"{self._cmd_handler.api_base}/getUpdates"
+            url = f"{self._keyboard.api_base}/getUpdates"
             params = {
                 "offset": self._last_update_id + 1,
                 "timeout": 1,
@@ -495,16 +463,16 @@ class TradingBot:
                 cb_id = callback["id"]
                 cb_data = callback.get("data", "")
 
-                # Refresh params before processing
+                # Refresh params
                 self._params["cycle_count"] = self._cycle_count
                 self._params["balance"] = self.broker.get_account_balance() if self.broker else 0
                 self._params["daily_dd"] = self.risk.daily_drawdown_pct if self.risk else 0
+                self._params["weekly_dd"] = self.risk.weekly_drawdown_pct if self.risk else 0
+                self._params["consecutive_losses"] = self.risk.consecutive_losses if self.risk else 0
+                self._params["session_name"] = self._news_filter.get_session_name() if self._news_filter else "N/A"
 
-                # Process button press
                 self._handle_button(cb_data)
-
-                # Acknowledge the button press
-                self._cmd_handler.answer_callback(cb_id)
+                self._keyboard.answer_callback(cb_id)
 
         except Exception as e:
             self.logger.debug(f"Telegram button poll error: {e}")
@@ -514,95 +482,90 @@ class TradingBot:
         if not data:
             return
 
-        # ── Toggle Pause/Resume ──
         if data == "toggle_pause":
             self._params["paused"] = not self._params.get("paused", False)
             action = "PAUSED" if self._params["paused"] else "RESUMED"
-            self._cmd_handler.notify_setting_changed("Bot", action)
+            self._keyboard.notify_setting_changed("Bot", action)
             if self._params["paused"]:
                 self.pause(reason="Paused via Telegram")
             else:
                 self.resume()
-            # Refresh menu
-            self._cmd_handler.show_main_menu(self._params)
+            self._keyboard.show_main_menu(self._params)
             return
 
-        # ── Toggle TSL ──
         elif data == "toggle_tsl":
             current = self._params.get("use_trailing_stop", True)
             self._params["use_trailing_stop"] = not current
             status = "ON" if self._params["use_trailing_stop"] else "OFF"
-            self._cmd_handler.notify_setting_changed("Trailing Stop", status)
-            self._cmd_handler.show_main_menu(self._params)
+            self._keyboard.notify_setting_changed("Trailing Stop", status)
+            self._keyboard.show_main_menu(self._params)
             return
 
-        # ── Risk presets ──
         elif data.startswith("risk_"):
             val = float(data.replace("risk_", ""))
             self._params["risk_percent"] = val
-            self._cmd_handler.notify_setting_changed("Risk/trade", f"{val}%")
-            self._cmd_handler.show_risk_menu(self._params)
+            self._keyboard.notify_setting_changed("Risk/trade", f"{val}%")
+            self._keyboard.show_risk_menu(self._params)
             return
 
-        # ── Confidence presets ──
         elif data.startswith("conf_"):
             val = float(data.replace("conf_", "")) / 100.0
             self._params["min_confidence"] = val
-            self._cmd_handler.notify_setting_changed("Min Confidence", f"{val*100:.0f}%")
-            self._cmd_handler.show_risk_menu(self._params)
+            self._keyboard.notify_setting_changed("Min Confidence", f"{val*100:.0f}%")
+            self._keyboard.show_risk_menu(self._params)
             return
 
-        # ── Max positions ──
         elif data.startswith("maxpos_"):
             val = int(data.replace("maxpos_", ""))
             self._params["max_positions"] = val
-            self._cmd_handler.notify_setting_changed("Max Positions", str(val))
-            self._cmd_handler.show_risk_menu(self._params)
+            self._keyboard.notify_setting_changed("Max Positions", str(val))
+            self._keyboard.show_risk_menu(self._params)
             return
 
-        # ── SL multiplier ──
         elif data.startswith("sl_"):
             val = float(data.replace("sl_", ""))
             self._params["atr_sl_mult"] = val
-            self._cmd_handler.notify_setting_changed("ATR SL", f"{val}×")
-            self._cmd_handler.show_sltp_menu(self._params)
+            self._keyboard.notify_setting_changed("ATR SL", f"{val}×")
+            self._keyboard.show_sltp_menu(self._params)
             return
 
-        # ── TP multiplier ──
         elif data.startswith("tp_"):
             val = float(data.replace("tp_", ""))
             self._params["atr_tp_mult"] = val
-            self._cmd_handler.notify_setting_changed("ATR TP", f"{val}×")
-            self._cmd_handler.show_sltp_menu(self._params)
+            self._keyboard.notify_setting_changed("ATR TP", f"{val}×")
+            self._keyboard.show_sltp_menu(self._params)
             return
 
-        # ── TSL activation ──
         elif data.startswith("tsl_act_"):
             val = float(data.replace("tsl_act_", ""))
             self._params["tsl_activation"] = val
-            self._cmd_handler.notify_setting_changed("TSL Activation", f"{val}× ATR")
-            self._cmd_handler.show_tsl_menu(self._params)
+            self._keyboard.notify_setting_changed("TSL Activation", f"{val}× ATR")
+            self._keyboard.show_tsl_menu(self._params)
             return
 
-        # ── TSL trail ──
         elif data.startswith("tsl_trail_"):
             val = float(data.replace("tsl_trail_", ""))
             self._params["tsl_atr_mult"] = val
-            self._cmd_handler.notify_setting_changed("TSL Trail", f"{val}× ATR")
-            self._cmd_handler.show_tsl_menu(self._params)
+            self._keyboard.notify_setting_changed("TSL Trail", f"{val}× ATR")
+            self._keyboard.show_tsl_menu(self._params)
             return
 
-        # ── Menu navigation ──
         elif data == "back_main":
-            self._cmd_handler.show_main_menu(self._params)
+            self._keyboard.show_main_menu(self._params)
         elif data == "menu_risk":
-            self._cmd_handler.show_risk_menu(self._params)
+            self._keyboard.show_risk_menu(self._params)
         elif data == "menu_sltp":
-            self._cmd_handler.show_sltp_menu(self._params)
+            self._keyboard.show_sltp_menu(self._params)
         elif data == "menu_tsl":
-            self._cmd_handler.show_tsl_menu(self._params)
+            self._keyboard.show_tsl_menu(self._params)
         elif data == "cmd_status":
-            self._cmd_handler.show_status(self._params)
+            self._keyboard.show_status(self._params)
+
+    def _handle_signal(self, signum):
+        """Handle OS signals for graceful shutdown."""
+        sig_name = signal.Signals(signum).name
+        self.logger.info(f"Received {sig_name}. Shutting down...")
+        self._running = False
 
     # ---- Utilities ----
 
@@ -610,7 +573,7 @@ class TradingBot:
         """Run a backtest for a symbol."""
         self.logger.info(f"Running backtest for {symbol}...")
         bt = StrategyBacktester(
-            initial_balance=self.config.bot.risk_percent * 1000,  # Scale from config
+            initial_balance=self.config.bot.risk_percent * 1000,
             commission_per_lot=7.0,
         )
         result = bt.run(symbol, df)
@@ -621,9 +584,10 @@ class TradingBot:
     def status(self):
         """Print current bot status."""
         print(f"\n{'='*40}")
-        print(f"BOT STATUS")
+        print(f"BOT STATUS (SURVIVAL MODE)")
         print(f"{'='*40}")
         print(f"State: {self.sm.state.value}")
+        print(f"Strategy: Pure indicators (no LSTM)")
         print(f"Cycle count: {self._cycle_count}")
 
         if self.broker and self.broker.connected:
@@ -637,6 +601,11 @@ class TradingBot:
             print(f"Open positions: {summary['total_positions']}")
             print(f"Total PnL: ${summary['total_pnl']:.2f}")
 
+        if self.risk:
+            print(f"Consecutive losses: {self.risk.consecutive_losses}")
+            print(f"Daily DD: {self.risk.daily_drawdown_pct:.1f}%")
+            print(f"Weekly DD: {self.risk.weekly_drawdown_pct:.1f}%")
+
 
 # ============================================================================
 # CLI Entry Point
@@ -645,7 +614,9 @@ class TradingBot:
 def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description="Exness AI Trading Bot")
+    parser = argparse.ArgumentParser(
+        description="Exness AI Trading Bot — SURVIVAL MODE"
+    )
     parser.add_argument(
         "mode",
         choices=["live", "backtest", "status", "train"],
@@ -679,48 +650,39 @@ def main():
         bot.shutdown()
 
     elif args.mode == "backtest":
-        # Backtest mode — loads data from CSV or falls back to yfinance
         import pandas as pd
         data_file = f"data/historical/{args.symbol}_H1.csv"
-
         if os.path.exists(data_file):
             df = pd.read_csv(data_file, index_col="time", parse_dates=True)
             bot.run_backtest(args.symbol, df)
         else:
             print(f"No historical data found at {data_file}")
-            print("Attempting to fetch data via yfinance fallback...")
-
+            print("Attempting yfinance fallback...")
             try:
                 import yfinance as yf
-                # Map symbols to yfinance tickers
                 yf_map = {"XAUUSD": "GC=F", "BTCUSD": "BTC-USD"}
-                yf_ticker = yf_map.get(args.symbol, args.symbol)
-
-                ticker = yf.Ticker(yf_ticker)
+                ticker = yf.Ticker(yf_map.get(args.symbol, args.symbol))
                 df = ticker.history(period="2y", interval="1h")
                 df.index.name = "time"
-
                 if not df.empty:
                     os.makedirs("data/historical", exist_ok=True)
                     df.to_csv(data_file)
-                    print(f"Data saved to {data_file}. Run backtest again.")
+                    print(f"Data saved. Run again.")
                 else:
-                    print(f"Failed to fetch data for {yf_ticker}")
+                    print(f"Failed to fetch data.")
             except ImportError:
-                print("yfinance not installed. Install with: pip install yfinance")
-                print("Or run `python main.py train` first to download data.")
+                print("Install yfinance: pip install yfinance")
             except Exception as e:
-                print(f"Error fetching data: {e}")
-                print("Run `python main.py train` first to download data.")
+                print(f"Error: {e}")
 
     elif args.mode == "train":
-        # Train mode — fetches data and trains LSTM models
+        # Train mode — still fetches data and saves for backtest
+        # (LSTM training removed — pure indicator strategy)
         if not bot.initialize():
             sys.exit(1)
 
         from data.collector import DataCollector
         collector = DataCollector()
-        trainer = LSTMTrainer(model_dir=bot.config.bot.model_dir)
 
         for symbol in get_all_pairs():
             pair_params = get_pair_params(symbol)
@@ -728,14 +690,13 @@ def main():
             if df is not None:
                 from data.indicators import add_indicators
                 df = add_indicators(df)
-
-                # Save for backtesting
                 os.makedirs("data/historical", exist_ok=True)
                 df.to_csv(f"data/historical/{symbol}_{pair_params.timeframe}.csv")
-
-                trainer.train(symbol, df, epochs=50)
+                print(f"Data saved: data/historical/{symbol}_{pair_params.timeframe}.csv")
 
         bot.shutdown()
+        print("\nNote: LSTM training removed. Strategy uses pure indicators.")
+        print("Run `python backtest_xauusd.py` to test the strategy.")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 """
 Pair-specific configuration for XAU/USD and BTC/USD.
-Parameters differ per instrument based on volatility characteristics.
+SIMPLIFIED — pure indicator-based strategy (no LSTM dependency).
 """
 
 from dataclasses import dataclass
@@ -14,31 +14,31 @@ class PairParams:
     atr_sl_multiplier: float      # ATR multiplier for stop loss
     atr_tp_multiplier: float      # ATR multiplier for take profit
     max_lot: float                # Maximum lot size
-    risk_percent: float           # Risk % per trade
-    min_confidence: float         # Minimum model confidence to enter
+    risk_percent: float           # Risk % per trade (SURVIVAL MODE: 0.5%)
+    min_confidence: float         # Minimum signal score to enter
     max_spread_points: int        # Max acceptable spread before skipping
     pip_value_per_lot: float      # $ value per pip per standard lot
 
 
-# Parameter table per the spec
+# Parameter table — optimized for consistency, not greed
 PAIR_CONFIG: Dict[str, PairParams] = {
     "XAUUSD": PairParams(
         timeframe="M15",
-        atr_sl_multiplier=2.0,       # OPTIMIZED: 2.0 (was 1.5)
-        atr_tp_multiplier=4.0,       # OPTIMIZED: 4.0 (was 3.0)
+        atr_sl_multiplier=2.0,
+        atr_tp_multiplier=4.0,
         max_lot=1.0,
-        risk_percent=1.0,
-        min_confidence=0.55,         # OPTIMIZED: 55% (was 70%)
+        risk_percent=0.5,            # SURVIVAL MODE: 0.5% (was 1.0%)
+        min_confidence=0.40,         # Lower threshold (pure indicators)
         max_spread_points=30,
         pip_value_per_lot=10.0,
     ),
     "BTCUSD": PairParams(
         timeframe="H1",
-        atr_sl_multiplier=2.5,       # OPTIMIZED: 2.5 (was 2.0)
-        atr_tp_multiplier=5.0,       # OPTIMIZED: 5.0 (was 4.0)
+        atr_sl_multiplier=2.5,
+        atr_tp_multiplier=5.0,
         max_lot=0.1,
-        risk_percent=0.5,
-        min_confidence=0.60,         # OPTIMIZED: 60% (was 75%)
+        risk_percent=0.5,            # SURVIVAL MODE: 0.5% (was 0.5%)
+        min_confidence=0.40,         # Lower threshold (pure indicators)
         max_spread_points=50,
         pip_value_per_lot=1.0,
     ),

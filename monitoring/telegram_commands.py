@@ -1,6 +1,6 @@
 """
 Telegram Inline Keyboard — Interactive button menu for bot control.
-No typing needed — just tap buttons.
+SURVIVAL MODE — pure indicators, no LSTM.
 """
 
 import json
@@ -13,10 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 class TelegramKeyboard:
-    """
-    Sends interactive inline keyboards via Telegram.
-    Users tap buttons instead of typing commands.
-    """
+    """Interactive inline keyboards via Telegram."""
 
     def __init__(self, bot_token: str, chat_id: str):
         self.bot_token = bot_token
@@ -25,17 +22,11 @@ class TelegramKeyboard:
         self._menu_message_id = None
 
     def send_message(self, text: str, reply_markup: dict = None, parse_mode: str = "Markdown") -> Optional[int]:
-        """Send a message with optional inline keyboard. Returns message_id."""
         try:
             url = f"{self.api_base}/sendMessage"
-            payload = {
-                "chat_id": self.chat_id,
-                "text": text,
-                "parse_mode": parse_mode,
-            }
+            payload = {"chat_id": self.chat_id, "text": text, "parse_mode": parse_mode}
             if reply_markup:
                 payload["reply_markup"] = json.dumps(reply_markup)
-
             resp = requests.post(url, json=payload, timeout=10)
             resp.raise_for_status()
             return resp.json().get("result", {}).get("message_id")
@@ -43,27 +34,7 @@ class TelegramKeyboard:
             logger.error(f"Telegram send failed: {e}")
             return None
 
-    def edit_message(self, text: str, reply_markup: dict = None) -> bool:
-        """Edit existing menu message with updated content."""
-        if not self._menu_message_id:
-            return False
-        try:
-            url = f"{self.api_base}/editMessageText"
-            payload = {
-                "chat_id": self.chat_id,
-                "message_id": self._menu_message_id,
-                "text": text,
-                "parse_mode": "Markdown",
-            }
-            if reply_markup:
-                payload["reply_markup"] = json.dumps(reply_markup)
-            resp = requests.post(url, json=payload, timeout=10)
-            return resp.status_code == 200
-        except Exception:
-            return False
-
     def answer_callback(self, callback_query_id: str, text: str = "", show_alert: bool = False):
-        """Acknowledge a button press."""
         try:
             url = f"{self.api_base}/answerCallbackQuery"
             requests.post(url, json={
@@ -79,7 +50,6 @@ class TelegramKeyboard:
     # ──────────────────────────────────────────
 
     def show_main_menu(self, bot_ref: dict) -> int:
-        """Show the main control panel with all buttons."""
         paused = bot_ref.get("paused", False)
         tsl_on = bot_ref.get("use_trailing_stop", False)
 
@@ -87,26 +57,32 @@ class TelegramKeyboard:
         tsl_status = "✅ ON" if tsl_on else "❌ OFF"
 
         text = (
-            f"🤖 *Ex-XAU Bot Control Panel*\n"
+            f"🤖 *Ex-XAU Bot (SURVIVAL MODE)*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Status: {status_emoji}\n\n"
+            f"Status: {status_emoji}\n"
+            f"Session: `{bot_ref.get('session_name', 'N/A')}`\n\n"
             f"📊 *Trading:*\n"
-            f"• Risk: `{bot_ref.get('risk_percent', 1.0)}%` per trade\n"
-            f"• Confidence: `{bot_ref.get('min_confidence', 0.55)*100:.0f}%`\n"
-            f"• Max Pos: `{bot_ref.get('max_positions', 3)}`\n\n"
+            f"• Risk: `{bot_ref.get('risk_percent', 0.5)}%` per trade\n"
+            f"• Confidence: `{bot_ref.get('min_confidence', 0.40)*100:.0f}%`\n"
+            f"• Max Pos: `{bot_ref.get('max_positions', 2)}`\n\n"
             f"📐 *SL/TP:*\n"
             f"• ATR SL: `{bot_ref.get('atr_sl_mult', 2.0)}×`\n"
             f"• ATR TP: `{bot_ref.get('atr_tp_mult', 4.0)}×`\n\n"
             f"🔄 *Trailing Stop:*\n"
             f"• Status: {tsl_status}\n"
-            f"• Activation: `{bot_ref.get('tsl_activation', 2.5)}× ATR`\n"
-            f"• Trail: `{bot_ref.get('tsl_atr_mult', 1.5)}× ATR`\n\n"
+            f"• Act: `{bot_ref.get('tsl_activation', 2.0)}×` | "
+            f"Trail: `{bot_ref.get('tsl_atr_mult', 1.0)}×`\n\n"
             f"📈 *Session:*\n"
             f"• Cycles: `{bot_ref.get('cycle_count', 0)}`\n"
+            f"• Consec. Loss: `{bot_ref.get('consecutive_losses', 0)}`\n"
         )
 
         if "balance" in bot_ref:
             text += f"• Balance: `${bot_ref['balance']:.2f}`\n"
+        if "daily_dd" in bot_ref:
+            text += f"• Daily DD: `{bot_ref['daily_dd']:.1f}%`\n"
+        if "weekly_dd" in bot_ref:
+            text += f"• Weekly DD: `{bot_ref['weekly_dd']:.1f}%`\n"
 
         keyboard = {
             "inline_keyboard": [
@@ -142,11 +118,12 @@ class TelegramKeyboard:
 
     def show_risk_menu(self, bot_ref: dict) -> int:
         text = (
-            f"📊 *Risk Settings*\n"
+            f"📊 *Risk Settings (SURVIVAL MODE)*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Risk: `{bot_ref.get('risk_percent', 1.0)}%`\n"
-            f"Confidence: `{bot_ref.get('min_confidence', 0.55)*100:.0f}%`\n"
-            f"Max Positions: `{bot_ref.get('max_positions', 3)}`\n\n"
+            f"Risk: `{bot_ref.get('risk_percent', 0.5)}%`\n"
+            f"Confidence: `{bot_ref.get('min_confidence', 0.40)*100:.0f}%`\n"
+            f"Max Positions: `{bot_ref.get('max_positions', 2)}`\n\n"
+            f"⚠️ _Risk >1% not recommended_\n"
             f"_Tap a value to change it_"
         )
 
@@ -160,16 +137,15 @@ class TelegramKeyboard:
                 [
                     {"text": "Risk: 1.5%", "callback_data": "risk_1.5"},
                     {"text": "Risk: 2.0%", "callback_data": "risk_2.0"},
-                    {"text": "Risk: 3.0%", "callback_data": "risk_3.0"},
                 ],
                 [
+                    {"text": "Conf: 35%", "callback_data": "conf_35"},
+                    {"text": "Conf: 40%", "callback_data": "conf_40"},
                     {"text": "Conf: 50%", "callback_data": "conf_50"},
+                ],
+                [
                     {"text": "Conf: 55%", "callback_data": "conf_55"},
                     {"text": "Conf: 60%", "callback_data": "conf_60"},
-                ],
-                [
-                    {"text": "Conf: 65%", "callback_data": "conf_65"},
-                    {"text": "Conf: 70%", "callback_data": "conf_70"},
                 ],
                 [
                     {"text": "MaxPos: 1", "callback_data": "maxpos_1"},
@@ -236,8 +212,8 @@ class TelegramKeyboard:
             f"🔄 *Trailing Stop Settings*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"Status: {'✅ ON' if tsl_on else '❌ OFF'}\n"
-            f"Activation: `{bot_ref.get('tsl_activation', 2.5)}× ATR`\n"
-            f"Trail Distance: `{bot_ref.get('tsl_atr_mult', 1.5)}× ATR`\n\n"
+            f"Activation: `{bot_ref.get('tsl_activation', 2.0)}× ATR`\n"
+            f"Trail Distance: `{bot_ref.get('tsl_atr_mult', 1.0)}× ATR`\n\n"
             f"_Tap to change_"
         )
 
@@ -286,21 +262,25 @@ class TelegramKeyboard:
         text = (
             f"📈 *Full Bot Status*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"State: {status_emoji}\n\n"
+            f"State: {status_emoji}\n"
+            f"Strategy: Pure indicators (no LSTM)\n\n"
             f"💰 *Account:*\n"
             f"• Balance: `${bot_ref.get('balance', 0):.2f}`\n"
-            f"• Daily DD: `{bot_ref.get('daily_dd', 0):.1f}%`\n\n"
-            f"⚙️ *Current Settings:*\n"
-            f"• Risk: `{bot_ref.get('risk_percent', 1.0)}%`\n"
-            f"• Confidence: `{bot_ref.get('min_confidence', 0.55)*100:.0f}%`\n"
-            f"• Max Pos: `{bot_ref.get('max_positions', 3)}`\n"
+            f"• Daily DD: `{bot_ref.get('daily_dd', 0):.1f}%`\n"
+            f"• Weekly DD: `{bot_ref.get('weekly_dd', 0):.1f}%`\n"
+            f"• Consec. Loss: `{bot_ref.get('consecutive_losses', 0)}`\n\n"
+            f"⚙️ *Settings:*\n"
+            f"• Risk: `{bot_ref.get('risk_percent', 0.5)}%`\n"
+            f"• Confidence: `{bot_ref.get('min_confidence', 0.40)*100:.0f}%`\n"
+            f"• Max Pos: `{bot_ref.get('max_positions', 2)}`\n"
             f"• ATR SL: `{bot_ref.get('atr_sl_mult', 2.0)}×`\n"
             f"• ATR TP: `{bot_ref.get('atr_tp_mult', 4.0)}×`\n"
             f"• TSL: {'ON' if tsl_on else 'OFF'}\n"
-            f"  Act: `{bot_ref.get('tsl_activation', 2.5)}×` | "
-            f"Trail: `{bot_ref.get('tsl_atr_mult', 1.5)}×`\n\n"
+            f"  Act: `{bot_ref.get('tsl_activation', 2.0)}×` | "
+            f"Trail: `{bot_ref.get('tsl_atr_mult', 1.0)}×`\n\n"
             f"📊 *Session:*\n"
-            f"• Cycles: `{bot_ref.get('cycle_count', 0)}`"
+            f"• Cycles: `{bot_ref.get('cycle_count', 0)}`\n"
+            f"• Session: `{bot_ref.get('session_name', 'N/A')}`"
         )
 
         keyboard = {
@@ -318,7 +298,6 @@ class TelegramKeyboard:
     # ──────────────────────────────────────────
 
     def notify_setting_changed(self, setting: str, value: str):
-        """Send a quick notification when a setting is changed."""
         self.send_message(f"✅ {setting} set to `{value}`")
 
     def notify_error(self, error: str):

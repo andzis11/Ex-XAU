@@ -1,13 +1,15 @@
 """
-backtest_xauusd.py — Standalone Backtest untuk Ex-XAU
-======================================================
-Strategi: EMA crossover + RSI filter + ATR-based SL/TP
+backtest_xauusd.py — Standalone Backtest (SURVIVAL MODE)
+=========================================================
+Strategy: Pure indicators (EMA/RSI/MACD/BB) + EMA200 trend filter
+NO LSTM — simpler, more consistent, more reliable.
 Pair    : XAU/USD (H1)
 Modal   : $500 (simulasi)
 
 Cara pakai:
   python backtest_xauusd.py                        # pakai data sample bawaan
   python backtest_xauusd.py --csv data/XAUUSD.csv  # pakai CSV dari MT5 export
+  python backtest_xauusd.py --no-tsl               # tanpa trailing stop
 """
 
 import argparse
@@ -20,41 +22,36 @@ from typing import List, Optional
 import numpy as np
 import pandas as pd
 
-try:
-    import pandas_ta as ta
-    USE_PANDAS_TA = True
-except ImportError:
-    USE_PANDAS_TA = False
-
 
 # ─────────────────────────────────────────────
-# 1. CONFIG
+# 1. CONFIG (SURVIVAL MODE)
 # ─────────────────────────────────────────────
 
 @dataclass
 class BacktestConfig:
-    initial_balance: float = 500.0       # Modal awal ($)
-    risk_percent: float = 1.0            # Risk per trade (% dari balance)
-    atr_sl_mult: float = 2.0             # SL = ATR × multiplier (OPTIMIZED: 2.0)
-    atr_tp_mult: float = 4.0             # TP = ATR × multiplier (OPTIMIZED: 4.0)
+    initial_balance: float = 500.0
+    risk_percent: float = 0.5              # SURVIVAL: 0.5% per trade
+    atr_sl_mult: float = 2.0
+    atr_tp_mult: float = 4.0
     atr_period: int = 14
-    ema_fast: int = 20                   # OPTIMIZED: 20 (was 9-20)
-    ema_slow: int = 50                   # OPTIMIZED: 50
+    ema_fast: int = 20
+    ema_slow: int = 50
     rsi_period: int = 14
-    rsi_ob: float = 65.0                 # OPTIMIZED: 65 (was 70)
-    rsi_os: float = 35.0                 # OPTIMIZED: 35 (was 30)
-    min_confidence: float = 0.55         # OPTIMIZED: 55% (was 60%)
+    rsi_ob: float = 65.0
+    rsi_os: float = 35.0
+    min_confidence: float = 0.40           # Lower for pure indicators
     max_spread_pips: float = 30.0
-    pip_value_per_lot: float = 10.0      # XAU: $10 per pip per lot
-    commission_per_lot: float = 7.0      # Round-trip commission
-    lot_size: float = 0.01               # Fixed micro lot
-    use_ema200_filter: bool = True       # OPTIMIZED: ON
-    trend_bias: float = 0.30             # OPTIMIZED: 0.30
+    pip_value_per_lot: float = 10.0
+    commission_per_lot: float = 7.0
+    lot_size: float = 0.01
 
-    # Trailing Stop settings
-    use_trailing_stop: bool = True       # Use trailing stop after TP distance reached
-    trailing_atr_mult: float = 1.0       # Trail distance = ATR × this multiplier
-    trailing_activation: float = 1.5     # Activate trailing stop after price moves this × ATR in profit
+    # Trailing stop
+    use_trailing_stop: bool = True
+    trailing_atr_mult: float = 1.0
+    trailing_activation: float = 2.0
+
+    # EMA200 trend filter
+    ema200_trend_bias: float = 0.30
 
 
 # ─────────────────────────────────────────────
@@ -67,11 +64,9 @@ def add_indicators(df: pd.DataFrame, cfg: BacktestConfig) -> pd.DataFrame:
     high  = df["high"]
     low   = df["low"]
 
-    # EMA
     df["ema_fast"] = close.ewm(span=cfg.ema_fast, adjust=False).mean()
     df["ema_slow"] = close.ewm(span=cfg.ema_slow, adjust=False).mean()
 
-    # RSI
     delta = close.diff()
     gain  = delta.clip(lower=0)
     loss  = -delta.clip(upper=0)
@@ -80,7 +75,6 @@ def add_indicators(df: pd.DataFrame, cfg: BacktestConfig) -> pd.DataFrame:
     rs    = avg_g / avg_l.replace(0, np.nan)
     df["rsi"] = 100 - (100 / (1 + rs))
 
-    # ATR
     tr = pd.concat([
         high - low,
         (high - close.shift()).abs(),
@@ -88,35 +82,28 @@ def add_indicators(df: pd.DataFrame, cfg: BacktestConfig) -> pd.DataFrame:
     ], axis=1).max(axis=1)
     df["atr"] = tr.ewm(com=cfg.atr_period - 1, adjust=False).mean()
 
-    # MACD
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
     df["macd"]        = ema12 - ema26
     df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
-    df["macd_hist"]   = df["macd"] - df["macd_signal"]
+    df["macd_diff"]   = df["macd"] - df["macd_signal"]
 
-    # Bollinger Bands
     sma20 = close.rolling(20).mean()
     std20 = close.rolling(20).std()
     df["bb_upper"] = sma20 + 2 * std20
     df["bb_lower"] = sma20 - 2 * std20
     df["bb_mid"]   = sma20
 
-    # EMA trend
     df["ema200"] = close.ewm(span=200, adjust=False).mean()
 
     return df.dropna()
 
 
 # ─────────────────────────────────────────────
-# 3. SIGNAL GENERATOR
+# 3. SIGNAL GENERATOR (Pure Indicators)
 # ─────────────────────────────────────────────
 
-def generate_signal(row: pd.Series, prev: pd.Series, cfg: BacktestConfig) -> dict:
-    """
-    Skor berbasis confluence dari 4 indikator.
-    Tiap konfirmasi menambah bobot.
-    """
+def generate_signal(row, prev, cfg):
     buy_score  = 0.0
     sell_score = 0.0
     reasons    = []
@@ -128,58 +115,48 @@ def generate_signal(row: pd.Series, prev: pd.Series, cfg: BacktestConfig) -> dic
     ema_trend_bear = row["ema_fast"] < row["ema_slow"]
 
     if ema_cross_up:
-        buy_score += 0.35
-        reasons.append("EMA crossover UP")
+        buy_score += 0.35; reasons.append("EMA cross UP")
     elif ema_trend_bull:
-        buy_score += 0.15
-        reasons.append("EMA trend bull")
+        buy_score += 0.15; reasons.append("EMA bull")
 
     if ema_cross_down:
-        sell_score += 0.35
-        reasons.append("EMA crossover DOWN")
+        sell_score += 0.35; reasons.append("EMA cross DN")
     elif ema_trend_bear:
-        sell_score += 0.15
-        reasons.append("EMA trend bear")
+        sell_score += 0.15; reasons.append("EMA bear")
 
     # ── RSI Filter (bobot 0.25) ──
-    if row["rsi"] < 50 and row["rsi"] > cfg.rsi_os:
-        buy_score += 0.25
-        reasons.append(f"RSI bullish ({row['rsi']:.0f})")
-    elif row["rsi"] > 50 and row["rsi"] < cfg.rsi_ob:
-        sell_score += 0.25
-        reasons.append(f"RSI bearish ({row['rsi']:.0f})")
+    rsi = row["rsi"]
+    if rsi < 50 and rsi > cfg.rsi_os:
+        buy_score += 0.25; reasons.append(f"RSI bull {rsi:.0f}")
+    elif rsi > 50 and rsi < cfg.rsi_ob:
+        sell_score += 0.25; reasons.append(f"RSI bear {rsi:.0f}")
 
     # ── MACD (bobot 0.20) ──
-    if row["macd"] > row["macd_signal"] and row["macd_hist"] > 0:
-        buy_score += 0.20
-        reasons.append("MACD bull")
-    elif row["macd"] < row["macd_signal"] and row["macd_hist"] < 0:
-        sell_score += 0.20
-        reasons.append("MACD bear")
+    if row["macd"] > row["macd_signal"] and row["macd_diff"] > 0:
+        buy_score += 0.20; reasons.append("MACD bull")
+    elif row["macd"] < row["macd_signal"] and row["macd_diff"] < 0:
+        sell_score += 0.20; reasons.append("MACD bear")
 
     # ── Bollinger Band (bobot 0.20) ──
     if row["close"] < row["bb_lower"]:
-        buy_score += 0.20
-        reasons.append("BB oversold")
+        buy_score += 0.20; reasons.append("BB oversold")
     elif row["close"] > row["bb_upper"]:
-        sell_score += 0.20
-        reasons.append("BB overbought")
+        sell_score += 0.20; reasons.append("BB overbought")
     elif row["close"] > row["bb_mid"]:
         buy_score += 0.10
     else:
         sell_score += 0.10
 
-    # ── Trend filter (EMA200) — OPTIMIZED ──
-    if cfg.use_ema200_filter:
-        above_ema200 = row["close"] > row["ema200"]
-        if above_ema200:
-            # Strong bias toward BUY in uptrend
-            buy_score  *= (1 + cfg.trend_bias)
-            sell_score *= (1 - cfg.trend_bias * 0.5)
-        else:
-            # Strong bias toward SELL in downtrend
-            buy_score  *= (1 - cfg.trend_bias * 0.5)
-            sell_score *= (1 + cfg.trend_bias)
+    # ── EMA200 Trend Filter (bias multiplier) ──
+    above_ema200 = row["close"] > row["ema200"]
+    if above_ema200:
+        buy_score  *= (1 + cfg.ema200_trend_bias)
+        sell_score *= (1 - cfg.ema200_trend_bias * 0.5)
+        reasons.append("Above EMA200")
+    else:
+        buy_score  *= (1 - cfg.ema200_trend_bias * 0.5)
+        sell_score *= (1 + cfg.ema200_trend_bias)
+        reasons.append("Below EMA200")
 
     # ── Tentukan arah ──
     if buy_score >= cfg.min_confidence and buy_score > sell_score:
@@ -211,11 +188,10 @@ class Trade:
     net_pnl: float = 0.0
     confidence: float = 0.0
     reasons: List[str] = field(default_factory=list)
-    # Trailing stop state
     tsl_active: bool = False
-    tsl_price: float = 0.0             # Current trailing stop price
-    max_profit: float = 0.0             # Track max unrealized profit
-    atr_at_entry: float = 0.0           # ATR at entry for dynamic trailing
+    tsl_price: float = 0.0
+    max_profit: float = 0.0
+    atr_at_entry: float = 0.0
 
 
 # ─────────────────────────────────────────────
@@ -241,17 +217,14 @@ class Backtest:
             prev = rows.iloc[i - 1]
             ts   = row.get("index", row.get("datetime", i))
 
-            # ── Check open trade ──
             if self.open_trade:
                 self._check_exit(row, ts)
 
-            # ── Generate signal ──
             if not self.open_trade:
                 sig = generate_signal(row, prev, self.cfg)
                 if sig["direction"] in ("BUY", "SELL"):
                     self._open_trade(row, sig, ts)
 
-            # ── Record equity ──
             mark = self._mark_to_market(row)
             self.equity_curve.append({
                 "time": str(ts),
@@ -260,7 +233,6 @@ class Backtest:
             })
             self.peak_balance = max(self.peak_balance, mark)
 
-        # Close any remaining trade at end
         if self.open_trade:
             last = rows.iloc[-1]
             self._force_close(last, last.get("index", len(rows) - 1))
@@ -280,26 +252,15 @@ class Backtest:
             sl = entry + atr * cfg.atr_sl_mult
             tp = entry - atr * cfg.atr_tp_mult
 
-        # Lot sizing: risk % of balance
         sl_dist = abs(entry - sl)
         risk_amt = self.balance * (cfg.risk_percent / 100)
-        lot = round(risk_amt / (sl_dist * cfg.pip_value_per_lot / 0.01), 2)
-        lot = max(0.01, min(lot, 1.0))  # clamp micro to 1.0 lot
+        lot = max(0.01, min(round(risk_amt / (sl_dist * cfg.pip_value_per_lot / 0.01), 2), 1.0))
 
         self.open_trade = Trade(
-            idx=self.trade_idx,
-            time=ts,
-            direction=d,
-            entry=entry,
-            sl=sl,
-            tp=tp,
-            lot=lot,
-            confidence=sig["confidence"],
-            reasons=sig["reasons"],
-            atr_at_entry=atr,
-            tsl_price=sl,              # TSL starts at original SL
-            max_profit=0.0,
-            tsl_active=False,
+            idx=self.trade_idx, time=ts, direction=d,
+            entry=entry, sl=sl, tp=tp, lot=lot,
+            confidence=sig["confidence"], reasons=sig["reasons"],
+            atr_at_entry=atr, tsl_price=sl, max_profit=0.0, tsl_active=False,
         )
         self.trade_idx += 1
 
@@ -313,7 +274,6 @@ class Backtest:
 
         # ── Update trailing stop ──
         if cfg.use_trailing_stop:
-            # Calculate current profit distance
             if t.direction == "BUY":
                 profit_dist = current_price - t.entry
                 peak_price = max(high, t.entry + t.max_profit) if t.max_profit > 0 else high
@@ -321,23 +281,19 @@ class Backtest:
                 profit_dist = t.entry - current_price
                 peak_price = min(low, t.entry - t.max_profit) if t.max_profit > 0 else low
 
-            # Track max profit in price terms
             if t.direction == "BUY":
                 t.max_profit = max(t.max_profit, current_price - t.entry)
             else:
                 t.max_profit = max(t.max_profit, t.entry - current_price)
 
-            # Activate trailing stop after threshold
             activation_dist = atr * cfg.trailing_activation
             if not t.tsl_active and profit_dist >= activation_dist:
                 t.tsl_active = True
-                # Set initial TSL at breakeven or original SL (whichever is better)
                 if t.direction == "BUY":
                     t.tsl_price = max(t.sl, t.entry)
                 else:
                     t.tsl_price = min(t.sl, t.entry)
 
-            # Trail the stop if active
             if t.tsl_active:
                 trail_dist = atr * cfg.trailing_atr_mult
                 if t.direction == "BUY":
@@ -349,24 +305,20 @@ class Backtest:
                     if new_tsl < t.tsl_price:
                         t.tsl_price = new_tsl
 
-        # ── Check if TSL hit ──
+        # ── Check TSL ──
         hit_tsl = False
         if t.tsl_active:
             if t.direction == "BUY" and low <= t.tsl_price:
-                hit_tsl = True
-                exit_p = t.tsl_price
+                hit_tsl = True; exit_p = t.tsl_price
             elif t.direction == "SELL" and high >= t.tsl_price:
-                hit_tsl = True
-                exit_p = t.tsl_price
+                hit_tsl = True; exit_p = t.tsl_price
 
         if hit_tsl:
-            t.exit_price = exit_p
-            t.exit_time = ts
-            t.exit_reason = "TSL"
+            t.exit_price = exit_p; t.exit_time = ts; t.exit_reason = "TSL"
             self._close_trade(t, exit_p, ts)
             return
 
-        # ── Check original SL ──
+        # ── Check original SL/TP ──
         hit_sl = False
         if t.direction == "BUY":
             if low <= t.sl:
@@ -387,13 +339,11 @@ class Backtest:
             else:
                 return
 
-        t.exit_price = exit_p
-        t.exit_time = ts
+        t.exit_price = exit_p; t.exit_time = ts
         t.exit_reason = "SL" if hit_sl else "TSL"
         self._close_trade(t, exit_p, ts)
 
     def _close_trade(self, t, exit_p, ts):
-        """Calculate P&L and close trade."""
         pip_dist = (exit_p - t.entry) if t.direction == "BUY" else (t.entry - exit_p)
         gross_pnl = pip_dist * self.cfg.pip_value_per_lot * t.lot / 0.01
         commission = self.cfg.commission_per_lot * t.lot
@@ -406,14 +356,11 @@ class Backtest:
 
     def _force_close(self, row, ts):
         t = self.open_trade
-        t.exit_price  = row["close"]
-        t.exit_time   = ts
-        t.exit_reason = "END"
+        t.exit_price = row["close"]; t.exit_time = ts; t.exit_reason = "END"
         pip_dist = (t.exit_price - t.entry) if t.direction == "BUY" else (t.entry - t.exit_price)
         gross = pip_dist * self.cfg.pip_value_per_lot * t.lot / 0.01
         comm  = self.cfg.commission_per_lot * t.lot
-        t.pnl = round(gross, 2)
-        t.commission = round(comm, 2)
+        t.pnl = round(gross, 2); t.commission = round(comm, 2)
         t.net_pnl = round(gross - comm, 2)
         self.balance += t.net_pnl
         self.trades.append(t)
@@ -460,7 +407,6 @@ class BacktestResult:
         self.profit_factor = gross_profit / gross_loss if gross_loss else float("inf")
         self.net_profit   = sum(x.net_pnl for x in t)
 
-        # Max drawdown
         eq = [e["equity"] for e in self.equity_curve]
         peak = eq[0]
         max_dd = 0.0
@@ -470,23 +416,17 @@ class BacktestResult:
             max_dd = max(max_dd, dd)
         self.max_dd = max_dd
 
-        # Sharpe (simplified daily)
         pnls = [x.net_pnl for x in t]
         self.sharpe = (np.mean(pnls) / np.std(pnls) * np.sqrt(252)) if np.std(pnls) > 0 else 0
 
-        # Daily stats
-        df_t = pd.DataFrame([{
-            "date": str(x.time)[:10],
-            "pnl": x.net_pnl,
-            "exit_reason": getattr(x, "exit_reason", "N/A"),
-        } for x in t])
+        df_t = pd.DataFrame([{"date": str(x.time)[:10], "pnl": x.net_pnl,
+                              "exit_reason": getattr(x, "exit_reason", "N/A")} for x in t])
         daily = df_t.groupby("date")["pnl"].sum()
         self.avg_daily_pnl  = daily.mean() if len(daily) else 0
         self.best_day       = daily.max() if len(daily) else 0
         self.worst_day      = daily.min() if len(daily) else 0
         self.days_traded    = len(daily)
 
-        # Exit reason breakdown
         exit_reasons = df_t["exit_reason"].value_counts().to_dict()
         self.exit_by_sl  = exit_reasons.get("SL", 0)
         self.exit_by_tp  = exit_reasons.get("TP", 0)
@@ -499,7 +439,8 @@ class BacktestResult:
 
         sep = "=" * 52
         print(f"\n{sep}")
-        print(f"  BACKTEST REPORT — XAUUSD H1")
+        print(f"  BACKTEST — XAUUSD H1 (SURVIVAL MODE)")
+        print(f"  Strategy: Pure indicators (no LSTM)")
         print(f"{sep}")
         print(f"  Modal awal     : ${self.initial_balance:>10.2f}")
         print(f"  Modal akhir    : ${final_balance:>10.2f}")
@@ -510,10 +451,17 @@ class BacktestResult:
         print(f"  Profit factor  : {self.profit_factor:.2f}  (>1.5 = bagus)")
         print(f"  Avg win        : ${self.avg_win:>+.2f}")
         print(f"  Avg loss       : ${self.avg_loss:>+.2f}")
-        print(f"  Reward/Risk    : {abs(self.avg_win/self.avg_loss):.2f}x" if self.avg_loss else "  Reward/Risk    : ∞")
+        rr = abs(self.avg_win/self.avg_loss) if self.avg_loss else 0
+        print(f"  Reward/Risk    : {rr:.2f}x")
         print(f"{sep}")
         print(f"  Max drawdown   : {self.max_dd:.1f}%")
         print(f"  Sharpe ratio   : {self.sharpe:.2f}  (>1.0 = layak)")
+        print(f"{sep}")
+        print(f"  Exit breakdown:")
+        print(f"    SL hit : {self.exit_by_sl}")
+        print(f"    TP hit : {self.exit_by_tp}")
+        print(f"    TSL hit: {self.exit_by_tsl}")
+        print(f"    End/BT : {self.exit_by_end}")
         print(f"{sep}")
         print(f"  Hari trading   : {self.days_traded}")
         print(f"  Avg profit/hari: ${self.avg_daily_pnl:>+.2f}")
@@ -521,16 +469,6 @@ class BacktestResult:
         print(f"  Hari terburuk  : ${self.worst_day:>+.2f}")
         print(f"{sep}")
 
-        # Exit breakdown
-        if hasattr(self, "exit_by_tsl"):
-            print(f"  Exit Breakdown:")
-            print(f"    SL hit    : {self.exit_by_sl}")
-            print(f"    TP hit    : {self.exit_by_tp}")
-            print(f"    TSL hit   : {self.exit_by_tsl}")
-            print(f"    End/BT    : {self.exit_by_end}")
-            print(f"{sep}")
-
-        # Assessment
         print(f"\n  ASSESSMENT:")
         if self.profit_factor >= 1.5 and self.win_rate >= 50 and self.max_dd <= 20:
             verdict = "✅ LAYAK untuk demo trading"
@@ -539,10 +477,6 @@ class BacktestResult:
         else:
             verdict = "❌ BELUM LAYAK — strategi perlu direvisi"
         print(f"  {verdict}")
-
-        if self.avg_daily_pnl > 0:
-            days_to_20 = 20 / self.avg_daily_pnl if self.avg_daily_pnl else float("inf")
-            print(f"  Target $20/hari: perlu ~{days_to_20:.0f}x lipat avg profit harian")
         print(f"{sep}\n")
 
     def save_json(self, path: str):
@@ -561,19 +495,11 @@ class BacktestResult:
             },
             "trades": [
                 {
-                    "id": t.idx,
-                    "time": str(t.time),
-                    "direction": t.direction,
-                    "entry": round(t.entry, 2),
-                    "sl": round(t.sl, 2),
-                    "tp": round(t.tp, 2),
-                    "lot": t.lot,
-                    "exit": round(t.exit_price, 2),
-                    "exit_reason": t.exit_reason,
-                    "net_pnl": t.net_pnl,
-                    "confidence": round(t.confidence, 3),
-                }
-                for t in self.trades
+                    "id": t.idx, "time": str(t.time), "direction": t.direction,
+                    "entry": round(t.entry, 2), "sl": round(t.sl, 2), "tp": round(t.tp, 2),
+                    "lot": t.lot, "exit": round(t.exit_price, 2),
+                    "exit_reason": t.exit_reason, "net_pnl": t.net_pnl,
+                } for t in self.trades
             ],
         }
         os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
@@ -586,34 +512,25 @@ class BacktestResult:
 # 7. DATA LOADER
 # ─────────────────────────────────────────────
 
-def load_data(csv_path: Optional[str] = None) -> pd.DataFrame:
+def load_data(csv_path=None):
     if csv_path and os.path.exists(csv_path):
-        print(f"  Memuat data dari: {csv_path}")
         df = pd.read_csv(csv_path)
-        # Normalize column names
         df.columns = [c.lower().strip() for c in df.columns]
-        for col in ["open", "high", "low", "close"]:
-            if col not in df.columns:
-                raise ValueError(f"Kolom '{col}' tidak ditemukan. Pastikan CSV dari MT5 format standard.")
         return df
     else:
         print("  Menggunakan data simulasi XAU/USD (2000 candle H1)...")
         np.random.seed(42)
         n = 2000
         dates = pd.date_range("2024-01-01", periods=n, freq="1h")
-        # Simulate realistic XAU/USD with trending behavior
         returns = np.random.normal(0.0001, 0.003, n)
-        # Add trending periods
         for i in range(0, n, 200):
             trend = np.random.choice([-1, 1]) * 0.0005
             returns[i:i+200] += trend
         price = 2000.0 * np.cumprod(1 + returns)
-        noise_h = abs(np.random.normal(0, 0.002, n))
-        noise_l = abs(np.random.normal(0, 0.002, n))
         df = pd.DataFrame({
             "open":   price,
-            "high":   price * (1 + noise_h),
-            "low":    price * (1 - noise_l),
+            "high":   price * (1 + abs(np.random.normal(0, 0.002, n))),
+            "low":    price * (1 - abs(np.random.normal(0, 0.002, n))),
             "close":  price * (1 + np.random.normal(0, 0.001, n)),
             "volume": np.random.randint(500, 8000, n),
         }, index=dates)
@@ -625,32 +542,29 @@ def load_data(csv_path: Optional[str] = None) -> pd.DataFrame:
 # ─────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Backtest Ex-XAU Strategy")
-    parser.add_argument("--csv",       type=str,   default=None,  help="Path ke CSV OHLCV dari MT5")
-    parser.add_argument("--balance",   type=float, default=500.0, help="Modal awal (default: 500)")
-    parser.add_argument("--risk",      type=float, default=1.0,   help="Risk per trade % (default: 1)")
-    parser.add_argument("--atr-sl",    type=float, default=2.0,   help="ATR SL multiplier (OPTIMIZED: 2.0)")
-    parser.add_argument("--atr-tp",    type=float, default=4.0,   help="ATR TP multiplier (OPTIMIZED: 4.0)")
-    parser.add_argument("--conf",      type=float, default=0.55,  help="Min confidence (OPTIMIZED: 0.55)")
-    parser.add_argument("--rsi-os",    type=float, default=35.0,  help="RSI oversold (OPTIMIZED: 35)")
-    parser.add_argument("--rsi-ob",    type=float, default=65.0,  help="RSI overbought (OPTIMIZED: 65)")
-    parser.add_argument("--no-ema200", action="store_true",       help="Disable EMA200 trend filter")
-    parser.add_argument("--bias",      type=float, default=0.30,  help="Trend bias (OPTIMIZED: 0.30)")
-    parser.add_argument("--no-tsl",    action="store_true",       help="Disable trailing stop")
-    parser.add_argument("--tsl-mult",  type=float, default=1.0,   help="Trailing ATR multiplier (default: 1.0)")
-    parser.add_argument("--tsl-act",   type=float, default=1.5,   help="Trailing activation × ATR (default: 1.5)")
-    parser.add_argument("--out",       type=str,   default="results/backtest_xauusd.json")
+    parser = argparse.ArgumentParser(description="Backtest Ex-XAU (SURVIVAL MODE)")
+    parser.add_argument("--csv",      type=str,   default=None)
+    parser.add_argument("--balance",  type=float, default=500.0)
+    parser.add_argument("--risk",     type=float, default=0.5,   help="Risk % (SURVIVAL: 0.5)")
+    parser.add_argument("--atr-sl",   type=float, default=2.0)
+    parser.add_argument("--atr-tp",   type=float, default=4.0)
+    parser.add_argument("--conf",     type=float, default=0.40)
+    parser.add_argument("--no-tsl",   action="store_true",       help="Disable trailing stop")
+    parser.add_argument("--tsl-mult", type=float, default=1.0)
+    parser.add_argument("--tsl-act",  type=float, default=2.0)
+    parser.add_argument("--out",      type=str,   default="results/backtest_xauusd.json")
     args = parser.parse_args()
 
     print("\n" + "=" * 52)
-    print("  EX-XAU BACKTEST ENGINE")
+    print("  EX-XAU BACKTEST — SURVIVAL MODE")
+    print("  Pure indicators (no LSTM)")
     print("=" * 52)
     print(f"  Modal    : ${args.balance}")
-    print(f"  Risk/trd : {args.risk}%")
+    print(f"  Risk/trd : {args.risk}% (SURVIVAL)")
     print(f"  SL mult  : {args.atr_sl}× ATR")
     print(f"  TP mult  : {args.atr_tp}× ATR")
     print(f"  Min conf : {args.conf*100:.0f}%")
-    print(f"  Trailing : {'ON' if not args.no_tsl else 'OFF'} (act={args.tsl_act}×, trail={args.tsl_mult}× ATR)")
+    print(f"  Trailing : {'OFF' if args.no_tsl else 'ON'}")
 
     cfg = BacktestConfig(
         initial_balance=args.balance,
@@ -658,10 +572,6 @@ def main():
         atr_sl_mult=args.atr_sl,
         atr_tp_mult=args.atr_tp,
         min_confidence=args.conf,
-        rsi_os=args.rsi_os,
-        rsi_ob=args.rsi_ob,
-        use_ema200_filter=not args.no_ema200,
-        trend_bias=args.bias,
         use_trailing_stop=not args.no_tsl,
         trailing_atr_mult=args.tsl_mult,
         trailing_activation=args.tsl_act,
