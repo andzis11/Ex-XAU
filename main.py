@@ -280,9 +280,17 @@ class TradingBot:
 
         self.logger.info(f"Starting main loop (interval: {interval_minutes} min)")
 
+        # Show initial Telegram menu
+        if self._cmd_handler:
+            self._params["cycle_count"] = 0
+            self._params["balance"] = self.broker.get_account_balance() if self.broker else 0
+            self._params["daily_dd"] = 0.0
+            self._cmd_handler.show_main_menu(self._params)
+            self.logger.info("Telegram control panel sent")
+
         try:
             while self._running and self.sm.is_active():
-                # Poll Telegram commands
+                # Poll Telegram buttons
                 self._poll_telegram_commands()
 
                 # Check if Telegram paused the bot
@@ -459,7 +467,7 @@ class TradingBot:
         self._running = False
 
     def _poll_telegram_commands(self):
-        """Check for new Telegram commands and process them."""
+        """Check for Telegram button presses and process them."""
         if not self._cmd_handler:
             return
 
@@ -468,7 +476,7 @@ class TradingBot:
             params = {
                 "offset": self._last_update_id + 1,
                 "timeout": 1,
-                "allowed_updates": ["message"],
+                "allowed_updates": ["callback_query"],
             }
             resp = requests.get(url, params=params, timeout=5)
             if resp.status_code != 200:
@@ -480,24 +488,121 @@ class TradingBot:
 
             for update in data["result"]:
                 self._last_update_id = update["update_id"]
-                message = update.get("message", {})
-                text = message.get("text", "")
-
-                if not text:
+                callback = update.get("callback_query", {})
+                if not callback:
                     continue
 
-                command, args = self._cmd_handler.parse_command(text)
-                if command:
-                    self._params["cycle_count"] = self._cycle_count
-                    self._params["balance"] = self.broker.get_account_balance() if self.broker else 0
-                    self._params["daily_dd"] = self.risk.daily_drawdown_pct if self.risk else 0
+                cb_id = callback["id"]
+                cb_data = callback.get("data", "")
 
-                    response = self._cmd_handler.handle_command(command, args, self._params)
-                    self._cmd_handler.send_message(response)
-                    self.logger.info(f"Telegram command: /{command} → {response[:50]}")
+                # Refresh params before processing
+                self._params["cycle_count"] = self._cycle_count
+                self._params["balance"] = self.broker.get_account_balance() if self.broker else 0
+                self._params["daily_dd"] = self.risk.daily_drawdown_pct if self.risk else 0
+
+                # Process button press
+                self._handle_button(cb_data)
+
+                # Acknowledge the button press
+                self._cmd_handler.answer_callback(cb_id)
 
         except Exception as e:
-            self.logger.debug(f"Telegram command poll error: {e}")
+            self.logger.debug(f"Telegram button poll error: {e}")
+
+    def _handle_button(self, data: str):
+        """Process inline keyboard button press."""
+        if not data:
+            return
+
+        # ── Toggle Pause/Resume ──
+        if data == "toggle_pause":
+            self._params["paused"] = not self._params.get("paused", False)
+            action = "PAUSED" if self._params["paused"] else "RESUMED"
+            self._cmd_handler.notify_setting_changed("Bot", action)
+            if self._params["paused"]:
+                self.pause(reason="Paused via Telegram")
+            else:
+                self.resume()
+            # Refresh menu
+            self._cmd_handler.show_main_menu(self._params)
+            return
+
+        # ── Toggle TSL ──
+        elif data == "toggle_tsl":
+            current = self._params.get("use_trailing_stop", True)
+            self._params["use_trailing_stop"] = not current
+            status = "ON" if self._params["use_trailing_stop"] else "OFF"
+            self._cmd_handler.notify_setting_changed("Trailing Stop", status)
+            self._cmd_handler.show_main_menu(self._params)
+            return
+
+        # ── Risk presets ──
+        elif data.startswith("risk_"):
+            val = float(data.replace("risk_", ""))
+            self._params["risk_percent"] = val
+            self._cmd_handler.notify_setting_changed("Risk/trade", f"{val}%")
+            self._cmd_handler.show_risk_menu(self._params)
+            return
+
+        # ── Confidence presets ──
+        elif data.startswith("conf_"):
+            val = float(data.replace("conf_", "")) / 100.0
+            self._params["min_confidence"] = val
+            self._cmd_handler.notify_setting_changed("Min Confidence", f"{val*100:.0f}%")
+            self._cmd_handler.show_risk_menu(self._params)
+            return
+
+        # ── Max positions ──
+        elif data.startswith("maxpos_"):
+            val = int(data.replace("maxpos_", ""))
+            self._params["max_positions"] = val
+            self._cmd_handler.notify_setting_changed("Max Positions", str(val))
+            self._cmd_handler.show_risk_menu(self._params)
+            return
+
+        # ── SL multiplier ──
+        elif data.startswith("sl_"):
+            val = float(data.replace("sl_", ""))
+            self._params["atr_sl_mult"] = val
+            self._cmd_handler.notify_setting_changed("ATR SL", f"{val}×")
+            self._cmd_handler.show_sltp_menu(self._params)
+            return
+
+        # ── TP multiplier ──
+        elif data.startswith("tp_"):
+            val = float(data.replace("tp_", ""))
+            self._params["atr_tp_mult"] = val
+            self._cmd_handler.notify_setting_changed("ATR TP", f"{val}×")
+            self._cmd_handler.show_sltp_menu(self._params)
+            return
+
+        # ── TSL activation ──
+        elif data.startswith("tsl_act_"):
+            val = float(data.replace("tsl_act_", ""))
+            self._params["tsl_activation"] = val
+            self._cmd_handler.notify_setting_changed("TSL Activation", f"{val}× ATR")
+            self._cmd_handler.show_tsl_menu(self._params)
+            return
+
+        # ── TSL trail ──
+        elif data.startswith("tsl_trail_"):
+            val = float(data.replace("tsl_trail_", ""))
+            self._params["tsl_atr_mult"] = val
+            self._cmd_handler.notify_setting_changed("TSL Trail", f"{val}× ATR")
+            self._cmd_handler.show_tsl_menu(self._params)
+            return
+
+        # ── Menu navigation ──
+        elif data == "back_main":
+            self._cmd_handler.show_main_menu(self._params)
+        elif data == "menu_risk":
+            self._cmd_handler.show_risk_menu(self._params)
+        elif data == "menu_sltp":
+            self._cmd_handler.show_sltp_menu(self._params)
+        elif data == "menu_tsl":
+            self._cmd_handler.show_tsl_menu(self._params)
+        elif data == "cmd_status":
+            self._cmd_handler.show_status(self._params)
 
     # ---- Utilities ----
 
