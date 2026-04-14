@@ -21,15 +21,12 @@ coverage.xml
 .gitattributes
 
 # IDE
-.vscode/
 .idea/
 *.swp
 *.swo
 *~
 
 # Environment variables
-.env
-.env.local
 .env.*.local
 
 # Credentials (NEVER commit these)
@@ -60,3 +57,5 @@ $null
 .checkpoint
 events.out.tfevents.*
 model.ckpt*
+config.bat
+node_modules

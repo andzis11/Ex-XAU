@@ -4,6 +4,8 @@ Pure indicator-based strategy. No LSTM dependency.
 Orchestrates all layers with a state machine and session-aware scheduling.
 """
 
+import utils.transport
+import utils.session
 import logging
 import os
 import signal
